@@ -1,0 +1,18 @@
+{
+    "naver_open_api": {
+        "client_id": "MLYaTi_d8E2qOxkCJVkk",
+        "client_secret": "ROjlTrqDEI"
+    },
+    "naver_ads_api": {
+        "access_license": "0100000000834a74c4feb5911f6f5a53c1a7eab0bf459bcb54d16390d426affc9269deec2b",
+        "secret_key": "AQAAAACDSnTE/rWRH29aU8Gn6rC/6suBK2E8RWiBT2j+xIZBBQ==",
+        "customer_id": "2717644"
+    },
+    "settings": {
+        "output_dir": "G:\\내 드라이브\\Antigravity_Work",
+        "min_search_volume": 1000,
+        "max_item_count": 500000,
+        "db_enabled": true,
+        "save_excel": false
+    }
+}
