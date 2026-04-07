@@ -31,16 +31,46 @@ def _dsn_from_env() -> Dict[str, Any]:
             "charset": "utf8mb4",
         }
 
-    host = (os.environ.get("MARIADB_HOST") or "").strip()
-    user = (os.environ.get("MARIADB_USER") or "").strip()
+    host = (
+        os.environ.get("MARIADB_HOST")
+        or os.environ.get("MYSQLHOST")
+        or os.environ.get("DB_HOST")
+        or ""
+    ).strip()
+    user = (
+        os.environ.get("MARIADB_USER")
+        or os.environ.get("MYSQLUSER")
+        or os.environ.get("DB_USER")
+        or ""
+    ).strip()
     if not host or not user:
-        raise RuntimeError("Set MYSQL_URL (Railway MariaDB) or MARIADB_HOST/MARIADB_USER")
+        raise RuntimeError(
+            "Set MYSQL_URL/MARIADB_URL or host/user vars "
+            "(MARIADB_HOST+MARIADB_USER, MYSQLHOST+MYSQLUSER)."
+        )
     return {
         "host": host,
-        "port": int((os.environ.get("MARIADB_PORT") or "3306").strip()),
+        "port": int(
+            (
+                os.environ.get("MARIADB_PORT")
+                or os.environ.get("MYSQLPORT")
+                or os.environ.get("DB_PORT")
+                or "3306"
+            ).strip()
+        ),
         "user": user,
-        "password": (os.environ.get("MARIADB_PASSWORD") or "").strip(),
-        "database": (os.environ.get("MARIADB_DATABASE") or "modiba").strip(),
+        "password": (
+            os.environ.get("MARIADB_PASSWORD")
+            or os.environ.get("MYSQLPASSWORD")
+            or os.environ.get("DB_PASSWORD")
+            or ""
+        ).strip(),
+        "database": (
+            os.environ.get("MARIADB_DATABASE")
+            or os.environ.get("MYSQLDATABASE")
+            or os.environ.get("DB_NAME")
+            or "modiba"
+        ).strip(),
         "charset": "utf8mb4",
     }
 
