@@ -6,7 +6,8 @@ import pandas as pd
 import streamlit as st
 
 from blue_ocean_tool import BlueOceanTool
-from db import query_top_keywords
+from db import query_report_metrics_full, query_report_top_per_seed
+from report_format import dataframe_from_db_metric_rows, report_to_excel_bytes
 
 
 def _period_to_range(label: str) -> Tuple[Optional[datetime], Optional[datetime]]:
@@ -35,7 +36,7 @@ def get_tool() -> BlueOceanTool:
 def run() -> None:
     st.set_page_config(page_title="Modiba BlueOcean", layout="wide")
     st.title("Modiba BlueOcean Web")
-    st.caption("Railway 웹서비스용 - 분석 실행 및 DB 결과 조회")
+    st.caption("Railway 웹서비스용 - 분석 실행 및 DB 결과 조회 (엑셀 템플릿 8열 형식)")
 
     with st.sidebar:
         st.subheader("실행 설정")
@@ -66,17 +67,29 @@ def run() -> None:
                     logs.append(msg)
 
                 with st.spinner("분석 중입니다. API 호출량에 따라 시간이 걸릴 수 있습니다."):
-                    result = tool.start_analysis(
+                    summary, report_df = tool.start_analysis(
                         seeds=seeds_text,
                         start_date=start_date.strftime("%Y-%m-%d"),
                         end_date=end_date.strftime("%Y-%m-%d"),
                         log_callback=_log,
                     )
                 st.code("\n".join(logs) if logs else "로그 없음")
-                if result:
-                    st.success(f"분석 완료: {result}")
+                if summary:
+                    st.success(f"분석 완료: {summary}")
                 else:
                     st.warning("결과가 없어 저장되지 않았습니다.")
+                if report_df is not None and not report_df.empty:
+                    st.subheader("리포트 미리보기 (템플릿 8열)")
+                    st.dataframe(report_df, use_container_width=True, hide_index=True)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M")
+                    xlsx = report_to_excel_bytes(report_df)
+                    st.download_button(
+                        label="엑셀 다운로드 (모디바 카테고리별 TOP10 형식)",
+                        data=xlsx,
+                        file_name=f"모디바_카테고리별_TOP10_추천분석서_{ts}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
         else:
             st.info("왼쪽 사이드바에서 조건을 설정하고 `분석 실행`을 눌러주세요.")
 
@@ -90,18 +103,50 @@ def run() -> None:
         with filter_col3:
             limit = st.selectbox("건수", [20, 50, 100, 200], index=1)
 
-        started_from, started_to = _period_to_range(period)
-        rows = query_top_keywords(
-            limit=int(limit),
-            keyword_like=(keyword_like or "").strip() or None,
-            started_from=started_from,
-            started_to=started_to,
-        )
+        top10_mode = st.checkbox("주제어별 상위 N건 (카테고리별 TOP10 스타일)", value=False)
+        top_n = 10
+        if top10_mode:
+            top_n = int(st.number_input("주제어당 건수", min_value=1, max_value=100, value=10))
 
-        if rows:
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
+        started_from, started_to = _period_to_range(period)
+
+        try:
+            if top10_mode:
+                raw_rows = query_report_top_per_seed(
+                    top_n=top_n,
+                    keyword_like=(keyword_like or "").strip() or None,
+                    started_from=started_from,
+                    started_to=started_to,
+                )
+                report_df_db = dataframe_from_db_metric_rows(raw_rows)
+            else:
+                raw_rows = query_report_metrics_full(
+                    limit=int(limit),
+                    keyword_like=(keyword_like or "").strip() or None,
+                    started_from=started_from,
+                    started_to=started_to,
+                )
+                report_df_db = dataframe_from_db_metric_rows(raw_rows)
+        except Exception as e:
+            st.error(f"DB 조회 실패: {e}")
+            report_df_db = pd.DataFrame()
+            raw_rows = []
+
+        if not report_df_db.empty:
+            st.subheader("템플릿 8열 형식")
+            st.dataframe(report_df_db, use_container_width=True, hide_index=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+            suffix = f"TOP{top_n}_" if top10_mode else ""
+            xlsx_db = report_to_excel_bytes(report_df_db)
+            st.download_button(
+                label="엑셀 다운로드 (DB 조회 결과)",
+                data=xlsx_db,
+                file_name=f"모디바_카테고리별_{suffix}추천분석서_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_db_report",
+                use_container_width=True,
+            )
+        elif not raw_rows:
             st.info("조회 결과가 없습니다.")
 
 

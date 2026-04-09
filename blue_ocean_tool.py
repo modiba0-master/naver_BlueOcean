@@ -11,7 +11,9 @@ import hmac
 import hashlib
 import base64
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
+
+from report_format import finalize_analysis_dataframe
 
 try:
     import customtkinter as ctk
@@ -196,11 +198,18 @@ class BlueOceanTool:
             finish_run(run_id, success=False, result_count=0, error_message=str(e))
             raise
 
-    def start_analysis(self, seeds=None, start_date=None, end_date=None, log_callback=None):
+    def start_analysis(
+        self,
+        seeds=None,
+        start_date=None,
+        end_date=None,
+        log_callback=None,
+    ) -> Tuple[Optional[str], Optional[pd.DataFrame]]:
         """
         GUI에서 실행하기 위한 분석 함수.
         - seeds/start_date/end_date가 없으면 기존처럼 console input을 사용합니다.
         - log_callback(msg) 를 주면 print 대신 콜백으로 메시지를 전달합니다.
+        - 반환: (요약 문자열 | None, 모디바 엑셀 템플릿 형식 DataFrame | None)
         """
         def log(msg=""):
             if log_callback is not None:
@@ -325,7 +334,8 @@ class BlueOceanTool:
         if all_results:
             df = pd.DataFrame(all_results).sort_values(by="블루오션 점수", ascending=False).head(100)  # 상위 100개만 리포트
 
-            df['전략 제언'] = df["블루오션 점수"].apply(self._strategy_text)
+            df["전략 제언"] = df["블루오션 점수"].apply(self._strategy_text)
+            report_df = finalize_analysis_dataframe(df)
 
             # DB 저장(기본)
             run_id = self._persist_to_db(all_results, trends_by_keyword, seeds, start_date, end_date, log)
@@ -352,17 +362,18 @@ class BlueOceanTool:
             if self.save_excel:
                 filename = f"모디바_통합분석리포트_주제어_{seed_part}_{timestamp}.xlsx"
                 filepath = os.path.join(self.report_dir, filename)
-                df.to_excel(filepath, index=False, engine='openpyxl')
+                report_df.to_excel(filepath, index=False, engine="openpyxl")
 
             log("\n✨ 분석이 완료되었습니다!")
             if filepath:
                 log(f"📁 리포트 저장 위치: {filepath}")
             else:
                 log("📁 엑셀 저장은 비활성화되어 DB만 저장했습니다. (settings.save_excel=false)")
-            return filepath or f"DB run_id={run_id}"
+            summary = filepath or f"DB run_id={run_id}"
+            return summary, report_df
 
         log("\n❌ 분석 결과가 없습니다. 주제어와 날짜 설정을 확인해주세요.")
-        return None
+        return None, None
 
 
 class BlueOceanToolGUI:
@@ -590,14 +601,14 @@ class BlueOceanToolGUI:
 
         def worker():
             try:
-                filepath = self.tool.start_analysis(
+                summary, _report_df = self.tool.start_analysis(
                     seeds=seeds,
                     start_date=start_date,
                     end_date=end_date,
                     log_callback=lambda m: self.log_queue.put(m),
                 )
-                if filepath:
-                    self.log_queue.put(f"\n✅ 결과: {filepath}")
+                if summary:
+                    self.log_queue.put(f"\n✅ 결과: {summary}")
             except Exception as e:
                 self.log_queue.put(f"\n❌ 오류 발생: {e}")
             finally:

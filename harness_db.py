@@ -8,6 +8,8 @@ from db import (
     finish_run,
     insert_keyword_metrics,
     insert_monthly_trends,
+    query_report_metrics_full,
+    query_report_top_per_seed,
     query_top_keywords,
 )
 
@@ -67,6 +69,11 @@ def main() -> None:
     print("ok top_count=", len(top))
     for row in top[:3]:
         print(row)
+
+    print("[H6] report query (full + top per seed) ...")
+    full = query_report_metrics_full(limit=10)
+    tps = query_report_top_per_seed(top_n=5)
+    print("ok full_rows=", len(full), "top_per_seed_rows=", len(tps))
 
     print("\nHarness completed.")
 

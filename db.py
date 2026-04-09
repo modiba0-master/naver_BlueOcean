@@ -268,3 +268,133 @@ def query_top_keywords(
             }
         )
     return out
+
+
+def query_report_metrics_full(
+    limit: int = 500,
+    keyword_like: Optional[str] = None,
+    started_from: Optional[datetime] = None,
+    started_to: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """
+    엑셀 템플릿(8열)에 맞추기 위한 전체 지표 행.
+    """
+    where_parts: List[str] = []
+    params: List[Any] = []
+    if keyword_like:
+        where_parts.append("km.keyword_text LIKE %s")
+        params.append(f"%{keyword_like.strip()}%")
+    if started_from:
+        where_parts.append("ar.started_at >= %s")
+        params.append(started_from)
+    if started_to:
+        where_parts.append("ar.started_at <= %s")
+        params.append(started_to)
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    lim = max(1, min(int(limit), 2000))
+    params.append(lim)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT ar.started_at,
+                       km.seed_keyword, km.keyword_text,
+                       km.monthly_search_volume_est, km.monthly_click_est, km.avg_ctr_pct,
+                       km.product_count, km.blue_ocean_score, km.strategy_text
+                FROM keyword_metrics km
+                JOIN analysis_runs ar ON ar.id = km.run_id
+                {where_sql}
+                ORDER BY km.blue_ocean_score DESC, ar.started_at DESC
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+            rows = cur.fetchall()
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "started_at": r[0],
+                "seed_keyword": r[1],
+                "keyword_text": r[2],
+                "monthly_search_volume_est": int(r[3]),
+                "monthly_click_est": float(r[4]),
+                "avg_ctr_pct": float(r[5]),
+                "product_count": int(r[6]),
+                "blue_ocean_score": float(r[7]),
+                "strategy_text": r[8] or "",
+            }
+        )
+    return out
+
+
+def query_report_top_per_seed(
+    top_n: int = 10,
+    keyword_like: Optional[str] = None,
+    started_from: Optional[datetime] = None,
+    started_to: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """
+    주제어(seed_keyword)별 블루오션 점수 상위 N건 (카테고리별 TOP10 리포트용).
+    MariaDB 10.2+ ROW_NUMBER() 필요.
+    """
+    where_parts: List[str] = []
+    params: List[Any] = []
+    if keyword_like:
+        where_parts.append("km.keyword_text LIKE %s")
+        params.append(f"%{keyword_like.strip()}%")
+    if started_from:
+        where_parts.append("ar.started_at >= %s")
+        params.append(started_from)
+    if started_to:
+        where_parts.append("ar.started_at <= %s")
+        params.append(started_to)
+    inner_where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    n = max(1, min(int(top_n), 100))
+    params.append(n)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT started_at, seed_keyword, keyword_text,
+                       monthly_search_volume_est, monthly_click_est, avg_ctr_pct,
+                       product_count, blue_ocean_score, strategy_text
+                FROM (
+                    SELECT ar.started_at,
+                           km.seed_keyword, km.keyword_text,
+                           km.monthly_search_volume_est, km.monthly_click_est, km.avg_ctr_pct,
+                           km.product_count, km.blue_ocean_score, km.strategy_text,
+                           ROW_NUMBER() OVER (
+                             PARTITION BY km.seed_keyword
+                             ORDER BY km.blue_ocean_score DESC, ar.started_at DESC
+                           ) AS rn
+                    FROM keyword_metrics km
+                    JOIN analysis_runs ar ON ar.id = km.run_id
+                    {inner_where}
+                ) ranked
+                WHERE ranked.rn <= %s
+                ORDER BY ranked.seed_keyword, ranked.blue_ocean_score DESC
+                """,
+                tuple(params),
+            )
+            rows = cur.fetchall()
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "started_at": r[0],
+                "seed_keyword": r[1],
+                "keyword_text": r[2],
+                "monthly_search_volume_est": int(r[3]),
+                "monthly_click_est": float(r[4]),
+                "avg_ctr_pct": float(r[5]),
+                "product_count": int(r[6]),
+                "blue_ocean_score": float(r[7]),
+                "strategy_text": r[8] or "",
+            }
+        )
+    return out
