@@ -1,0 +1,18 @@
+---
+description: Stability-first Modiba backend working rules
+alwaysApply: true
+---
+
+# Modiba Stability Rules
+
+- Never break working behavior; prefer minimal, safe changes.
+- Analyze root cause first, then modify code.
+- Do not change auth/signing, external API request shape, env/secrets, infra/deploy config, DB schema, or core business logic without explicit user approval.
+- Must ask before multi-file changes, dependency additions, API contract changes, file delete/rename, or infra-impacting edits.
+- Safe auto-run scope: UI improvements, logging/debug, and small single-file bug fixes.
+- Error triage defaults:
+  - 403: check IP/auth first
+  - 400: check request format first
+  - 500: check server-side/runtime first
+- Security: never expose API keys; never log sensitive data.
+- Prioritize stability over speed in every change.
