@@ -3,3 +3,4 @@ pandas
 pymysql
 openpyxl
 streamlit
+xlrd

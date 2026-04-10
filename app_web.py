@@ -34,19 +34,25 @@ def get_tool() -> BlueOceanTool:
 
 
 @st.cache_data
-def load_category_hierarchy() -> Tuple[List[str], Dict[str, List[str]], Dict[tuple, List[str]], Dict[tuple, List[str]]]:
+def load_category_hierarchy() -> Tuple[List[str], Dict[str, List[str]], Dict[tuple, List[str]], Dict[tuple, List[str]], str]:
     level1_options: List[str] = []
     level2_map: Dict[str, List[str]] = {}
     level3_map: Dict[tuple, List[str]] = {}
     level4_map: Dict[tuple, List[str]] = {}
+    load_message = ""
 
-    path = resource_path("category_naver.xls")
-    if not os.path.exists(path):
-        return level1_options, level2_map, level3_map, level4_map
+    candidate_paths = [
+        resource_path("category_naver.xls"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "category_naver.xls"),
+        os.path.join(os.getcwd(), "category_naver.xls"),
+    ]
+    path = next((p for p in candidate_paths if os.path.exists(p)), "")
+    if not path:
+        return level1_options, level2_map, level3_map, level4_map, "파일 경로를 찾지 못했습니다."
     try:
         df = pd.read_excel(path)
         if df.shape[1] < 5:
-            return level1_options, level2_map, level3_map, level4_map
+            return level1_options, level2_map, level3_map, level4_map, "엑셀 열 구조가 예상과 다릅니다."
         category_df = df.iloc[:, 1:5].fillna("")
         for _, row in category_df.iterrows():
             l1, l2, l3, l4 = [str(v).strip() for v in row.tolist()]
@@ -69,8 +75,9 @@ def load_category_hierarchy() -> Tuple[List[str], Dict[str, List[str]], Dict[tup
                 if l4 not in level4_map[key4]:
                     level4_map[key4].append(l4)
     except Exception:
-        return [], {}, {}, {}
-    return level1_options, level2_map, level3_map, level4_map
+        return [], {}, {}, {}, f"엑셀 로딩 실패: {path}"
+    load_message = f"카테고리 파일 로드됨: {path}"
+    return level1_options, level2_map, level3_map, level4_map, load_message
 
 
 def _pick_selected_category_keyword(l1: str, l2: str, l3: str, l4: str) -> str:
@@ -105,8 +112,9 @@ def run() -> None:
     with st.sidebar:
         st.subheader("실행 설정")
         st.caption("네이버 카테고리 필터")
-        level1_options, level2_map, level3_map, level4_map = load_category_hierarchy()
+        level1_options, level2_map, level3_map, level4_map, load_message = load_category_hierarchy()
         if level1_options:
+            st.caption(load_message)
             l1 = st.selectbox("대분류", level1_options, key="cat_l1_web")
             l2_values = level2_map.get(l1, []) or ["-"]
             l2 = st.selectbox("중분류", l2_values, key="cat_l2_web")
@@ -116,7 +124,7 @@ def run() -> None:
             l4 = st.selectbox("세분류", l4_values, key="cat_l4_web")
             _sync_seed_in_session(_pick_selected_category_keyword(l1, l2, l3, l4))
         else:
-            st.caption("category_naver.xls를 찾지 못해 카테고리 필터를 표시할 수 없습니다.")
+            st.warning(f"카테고리 필터를 표시할 수 없습니다. ({load_message})")
 
         seeds_text = st.text_input("주제어(쉼표로 구분)", key="seed_input")
         default_end = date.today()
