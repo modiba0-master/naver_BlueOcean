@@ -1,11 +1,11 @@
 import os
 from datetime import date, datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
-from blue_ocean_tool import BlueOceanTool
+from blue_ocean_tool import BlueOceanTool, resource_path
 from db import query_report_metrics_full, query_report_top_per_seed
 from report_format import dataframe_from_db_metric_rows, report_to_excel_bytes
 
@@ -33,14 +33,92 @@ def get_tool() -> BlueOceanTool:
     return BlueOceanTool(config_path="config.json")
 
 
+@st.cache_data
+def load_category_hierarchy() -> Tuple[List[str], Dict[str, List[str]], Dict[tuple, List[str]], Dict[tuple, List[str]]]:
+    level1_options: List[str] = []
+    level2_map: Dict[str, List[str]] = {}
+    level3_map: Dict[tuple, List[str]] = {}
+    level4_map: Dict[tuple, List[str]] = {}
+
+    path = resource_path("category_naver.xls")
+    if not os.path.exists(path):
+        return level1_options, level2_map, level3_map, level4_map
+    try:
+        df = pd.read_excel(path)
+        if df.shape[1] < 5:
+            return level1_options, level2_map, level3_map, level4_map
+        category_df = df.iloc[:, 1:5].fillna("")
+        for _, row in category_df.iterrows():
+            l1, l2, l3, l4 = [str(v).strip() for v in row.tolist()]
+            if not l1:
+                continue
+            if l1 not in level1_options:
+                level1_options.append(l1)
+            if l2:
+                level2_map.setdefault(l1, [])
+                if l2 not in level2_map[l1]:
+                    level2_map[l1].append(l2)
+            if l2 and l3:
+                key3 = (l1, l2)
+                level3_map.setdefault(key3, [])
+                if l3 not in level3_map[key3]:
+                    level3_map[key3].append(l3)
+            if l2 and l3 and l4:
+                key4 = (l1, l2, l3)
+                level4_map.setdefault(key4, [])
+                if l4 not in level4_map[key4]:
+                    level4_map[key4].append(l4)
+    except Exception:
+        return [], {}, {}, {}
+    return level1_options, level2_map, level3_map, level4_map
+
+
+def _pick_selected_category_keyword(l1: str, l2: str, l3: str, l4: str) -> str:
+    for v in [l4, l3, l2, l1]:
+        if v and v not in {"-", "데이터 없음"}:
+            return v
+    return ""
+
+
+def _sync_seed_in_session(selected: str):
+    current = st.session_state.get("seed_input", "")
+    parts = [p.strip() for p in str(current).split(",") if p.strip()]
+    prev_auto = st.session_state.get("auto_category_seed_web")
+    if prev_auto and prev_auto in parts:
+        parts = [p for p in parts if p != prev_auto]
+    if selected and selected not in parts:
+        parts.append(selected)
+    st.session_state["seed_input"] = ", ".join(parts)
+    st.session_state["auto_category_seed_web"] = selected or None
+
+
 def run() -> None:
     st.set_page_config(page_title="Modiba BlueOcean", layout="wide")
     st.title("Modiba BlueOcean Web")
     st.caption("Railway 웹서비스용 - 분석 실행 및 DB 결과 조회 (엑셀 템플릿 8열 형식)")
 
+    if "seed_input" not in st.session_state:
+        st.session_state["seed_input"] = "축산물, 정육"
+    if "auto_category_seed_web" not in st.session_state:
+        st.session_state["auto_category_seed_web"] = None
+
     with st.sidebar:
         st.subheader("실행 설정")
-        seeds_text = st.text_input("주제어(쉼표로 구분)", value="축산물, 정육")
+        st.caption("네이버 카테고리 필터")
+        level1_options, level2_map, level3_map, level4_map = load_category_hierarchy()
+        if level1_options:
+            l1 = st.selectbox("대분류", level1_options, key="cat_l1_web")
+            l2_values = level2_map.get(l1, []) or ["-"]
+            l2 = st.selectbox("중분류", l2_values, key="cat_l2_web")
+            l3_values = level3_map.get((l1, l2), []) or ["-"]
+            l3 = st.selectbox("소분류", l3_values, key="cat_l3_web")
+            l4_values = level4_map.get((l1, l2, l3), []) or ["-"]
+            l4 = st.selectbox("세분류", l4_values, key="cat_l4_web")
+            _sync_seed_in_session(_pick_selected_category_keyword(l1, l2, l3, l4))
+        else:
+            st.caption("category_naver.xls를 찾지 못해 카테고리 필터를 표시할 수 없습니다.")
+
+        seeds_text = st.text_input("주제어(쉼표로 구분)", key="seed_input")
         default_end = date.today()
         default_start = default_end - timedelta(days=120)
         start_date = st.date_input("분석 시작일", value=default_start)
