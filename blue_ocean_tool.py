@@ -96,6 +96,7 @@ class BlueOceanTool:
         self.output_dir = self.config['settings']['output_dir']
         self.save_excel = bool(self.config.get("settings", {}).get("save_excel", False))
         self.db_enabled = bool(self.config.get("settings", {}).get("db_enabled", True))
+        self._apply_db_env_from_config()
         
         # 출력 폴더 생성
         if not os.path.exists(self.output_dir):
@@ -107,7 +108,41 @@ class BlueOceanTool:
         if self.db_enabled:
             if ensure_schema is None:
                 raise RuntimeError("DB 모듈(db.py) 로드 실패: MariaDB 저장을 사용할 수 없습니다.")
-            ensure_schema()
+            try:
+                ensure_schema()
+            except Exception as e:
+                # DB 설정이 없어도 GUI 사용은 가능해야 하므로 저장 기능만 비활성화
+                self.db_enabled = False
+                print(f"[WARN] DB 연결 설정 누락/실패로 DB 저장을 비활성화합니다: {e}")
+
+    def _apply_db_env_from_config(self):
+        """
+        config.json의 database 항목을 환경변수로 보강한다.
+        기존 환경변수가 이미 있으면 덮어쓰지 않는다.
+        """
+        db_cfg = self.config.get("database", {}) or {}
+        if not isinstance(db_cfg, dict):
+            return
+
+        mysql_url = str(db_cfg.get("mysql_url", "") or db_cfg.get("mariadb_url", "")).strip()
+        if mysql_url and not (
+            (os.environ.get("MYSQL_URL") or "").strip()
+            or (os.environ.get("MARIADB_URL") or "").strip()
+            or (os.environ.get("DATABASE_URL") or "").strip()
+        ):
+            os.environ["MYSQL_URL"] = mysql_url
+
+        mapping = {
+            "host": "MARIADB_HOST",
+            "port": "MARIADB_PORT",
+            "user": "MARIADB_USER",
+            "password": "MARIADB_PASSWORD",
+            "database": "MARIADB_DATABASE",
+        }
+        for key, env_name in mapping.items():
+            value = str(db_cfg.get(key, "")).strip()
+            if value and not (os.environ.get(env_name) or "").strip():
+                os.environ[env_name] = value
 
     def get_monthly_trends(self, keyword, start_date, end_date):
         """요청된 기간의 월별 트렌드 지수 수집"""
@@ -751,7 +786,7 @@ if __name__ == "__main__":
     try:
         tool = BlueOceanTool()
     except Exception as e:
-        print(f"\n❌ 오류 발생: {e}")
+        print(f"\n오류 발생: {e}")
         raise
 
     # GUI 모드: 기본 실행은 GUI로 전환(콘솔은 --cli 옵션일 때)
@@ -766,7 +801,7 @@ if __name__ == "__main__":
         try:
             tool.start_analysis()
         except Exception as e:
-            print(f"\n❌ 오류 발생: {e}")
+            print(f"\n오류 발생: {e}")
     else:
         gui = BlueOceanToolGUI(tool)
         gui.mainloop()

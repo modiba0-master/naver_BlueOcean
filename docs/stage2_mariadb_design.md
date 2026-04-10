@@ -41,3 +41,20 @@ python harness_db.py
 - `blue_ocean_tool.py`의 `all_results` 생성부를 DB insert 흐름으로 연결
 - Excel 저장은 옵션화(기본 OFF)
 - UI에서 "DB 저장/검색" 버튼 추가
+
+## 운영 점검 기록 (2026-04-10)
+- Railway CLI 로그인 확인: `railway whoami` -> `modiba0@gmail.com`
+- 링크 상태 확인: `railway status` -> `modiba-blueocean / production / blueocean-app`
+- 변수 확인: `railway variables` 에 `MARIADB_HOST/PORT/USER/PASSWORD/DATABASE` 확인
+- 송수신 검증: `railway ssh -s blueocean-app python harness_db.py`
+  - H1 schema ensure: OK
+  - H2 run insert: OK
+  - H3/H4 metrics, trends insert/upsert: OK
+  - H5/H6 read query: OK
+
+## 운영 메모 (로그인 세션 보존)
+- Railway 로그인 세션은 터미널 프로파일 기준으로 유지된다.
+- 세션 확인은 아래 명령으로 빠르게 점검한다.
+  - `railway whoami`
+  - `railway status`
+- 세션이 만료된 경우에만 `railway login`을 재실행한다.
