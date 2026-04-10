@@ -389,6 +389,12 @@ class BlueOceanToolGUI:
         self.app.title("블루오션 자동 탐색 툴")
         self.app.geometry("760x860")
         self.app.minsize(700, 760)
+        self.level1_options: List[str] = []
+        self.level2_map: Dict[str, List[str]] = {}
+        self.level3_map: Dict[tuple, List[str]] = {}
+        self.level4_map: Dict[tuple, List[str]] = {}
+        self.auto_category_seed: Optional[str] = None
+        self._load_category_hierarchy()
 
         # 상태
         self.log_queue: "queue.Queue[str]" = queue.Queue()
@@ -412,9 +418,33 @@ class BlueOceanToolGUI:
             anchor="w",
             font=ctk.CTkFont(size=14, weight="bold"),
         ).pack(fill="x", padx=6, pady=(0, 6))
+        ctk.CTkLabel(root, text="카테고리 필터 (category_naver.xls 기반)", anchor="w").pack(fill="x", padx=6)
+        category_row = ctk.CTkFrame(root, corner_radius=10, fg_color="transparent")
+        category_row.pack(fill="x", padx=6, pady=(6, 8))
+        category_row.grid_columnconfigure(0, weight=1)
+        category_row.grid_columnconfigure(1, weight=1)
+        category_row.grid_columnconfigure(2, weight=1)
+        category_row.grid_columnconfigure(3, weight=1)
+
+        fallback = ["데이터 없음"]
+        l1_values = self.level1_options or fallback
+        self.cat_l1_menu = ctk.CTkOptionMenu(category_row, values=l1_values, command=self.on_cat_l1_changed)
+        self.cat_l1_menu.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.cat_l2_menu = ctk.CTkOptionMenu(category_row, values=fallback, command=self.on_cat_l2_changed)
+        self.cat_l2_menu.grid(row=0, column=1, sticky="ew", padx=4)
+        self.cat_l3_menu = ctk.CTkOptionMenu(category_row, values=fallback, command=self.on_cat_l3_changed)
+        self.cat_l3_menu.grid(row=0, column=2, sticky="ew", padx=4)
+        self.cat_l4_menu = ctk.CTkOptionMenu(category_row, values=fallback, command=self.on_cat_l4_changed)
+        self.cat_l4_menu.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+
         ctk.CTkLabel(root, text="주제어(시드 키워드) - 콤마로 구분", anchor="w").pack(fill="x", padx=6)
         self.seed_entry = ctk.CTkEntry(root, height=38, placeholder_text="예: 캠핑용품, 주방용품")
         self.seed_entry.pack(fill="x", padx=6, pady=(6, 12))
+        if self.level1_options:
+            self.cat_l1_menu.set(self.level1_options[0])
+            self.on_cat_l1_changed(self.level1_options[0])
+        else:
+            self.cat_l1_menu.set("데이터 없음")
 
         row = ctk.CTkFrame(root, corner_radius=10)
         row.pack(fill="x", padx=6, pady=(0, 12))
@@ -509,6 +539,85 @@ class BlueOceanToolGUI:
         self.log_box.configure(state="disabled")
 
         self.app.after(100, self._poll_queues)
+
+    def _load_category_hierarchy(self):
+        path = resource_path("category_naver.xls")
+        if not os.path.exists(path):
+            return
+        try:
+            df = pd.read_excel(path)
+            if df.shape[1] < 5:
+                return
+            category_df = df.iloc[:, 1:5].fillna("")
+            for _, row in category_df.iterrows():
+                l1, l2, l3, l4 = [str(v).strip() for v in row.tolist()]
+                if not l1:
+                    continue
+                if l1 not in self.level1_options:
+                    self.level1_options.append(l1)
+                if l2:
+                    self.level2_map.setdefault(l1, [])
+                    if l2 not in self.level2_map[l1]:
+                        self.level2_map[l1].append(l2)
+                if l2 and l3:
+                    key3 = (l1, l2)
+                    self.level3_map.setdefault(key3, [])
+                    if l3 not in self.level3_map[key3]:
+                        self.level3_map[key3].append(l3)
+                if l2 and l3 and l4:
+                    key4 = (l1, l2, l3)
+                    self.level4_map.setdefault(key4, [])
+                    if l4 not in self.level4_map[key4]:
+                        self.level4_map[key4].append(l4)
+        except Exception:
+            return
+
+    def _set_menu_values(self, menu, values: List[str]):
+        items = values if values else ["-"]
+        menu.configure(values=items)
+        menu.set(items[0])
+
+    def on_cat_l1_changed(self, selected: str):
+        l2_values = self.level2_map.get(selected, [])
+        self._set_menu_values(self.cat_l2_menu, l2_values)
+        self.on_cat_l2_changed(self.cat_l2_menu.get())
+
+    def on_cat_l2_changed(self, selected: str):
+        l1 = self.cat_l1_menu.get()
+        l3_values = self.level3_map.get((l1, selected), [])
+        self._set_menu_values(self.cat_l3_menu, l3_values)
+        self.on_cat_l3_changed(self.cat_l3_menu.get())
+
+    def on_cat_l3_changed(self, selected: str):
+        l1 = self.cat_l1_menu.get()
+        l2 = self.cat_l2_menu.get()
+        l4_values = self.level4_map.get((l1, l2, selected), [])
+        self._set_menu_values(self.cat_l4_menu, l4_values)
+        self.on_cat_l4_changed(self.cat_l4_menu.get())
+
+    def on_cat_l4_changed(self, selected: str):
+        self._sync_seed_entry_with_category()
+
+    def _current_selected_category_keyword(self) -> str:
+        picks = [self.cat_l4_menu.get(), self.cat_l3_menu.get(), self.cat_l2_menu.get(), self.cat_l1_menu.get()]
+        return next((v for v in picks if v and v not in {"-", "데이터 없음"}), "")
+
+    def _sync_seed_entry_with_category(self):
+        selected = self._current_selected_category_keyword()
+        current = self.seed_entry.get().strip()
+        parts = [p.strip() for p in current.split(",") if p.strip()]
+
+        # 카테고리 탐색 중 누적 방지를 위해, 이전 자동 삽입값만 교체
+        if self.auto_category_seed and self.auto_category_seed in parts:
+            parts = [p for p in parts if p != self.auto_category_seed]
+
+        if selected and selected not in parts:
+            parts.append(selected)
+
+        self.seed_entry.delete(0, "end")
+        if parts:
+            self.seed_entry.insert(0, ", ".join(parts))
+        self.auto_category_seed = selected or None
 
     def append_log(self, msg: str):
         # GUI 업데이트는 main thread에서만
