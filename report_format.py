@@ -37,6 +37,18 @@ def _format_ctr(value: Any) -> str:
         return "0.00%"
 
 
+def _format_blue_ocean_score_pct(value: Any) -> str:
+    if value is None:
+        return "0.00%"
+    s = str(value).strip()
+    if s.endswith("%"):
+        return s
+    try:
+        return f"{float(value):.2f}%"
+    except (TypeError, ValueError):
+        return "0.00%"
+
+
 def finalize_analysis_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """분석 단계에서 만든 DataFrame을 템플릿 열 순서로 맞춤."""
     missing = [c for c in EXCEL_REPORT_COLUMNS if c not in df.columns]
@@ -58,7 +70,7 @@ def dataframe_from_db_metric_rows(rows: Iterable[Dict[str, Any]]) -> pd.DataFram
                 "월평균 클릭수(추정)": float(r.get("monthly_click_est", 0.0) or 0.0),
                 "평균 클릭율(CTR)": _format_ctr(r.get("avg_ctr_pct")),
                 "상품수": int(r.get("product_count", 0) or 0),
-                "블루오션 점수": round(float(r.get("blue_ocean_score", 0.0) or 0.0), 4),
+                "블루오션 점수": _format_blue_ocean_score_pct(r.get("blue_ocean_score", 0.0)),
                 "전략 제언": (r.get("strategy_text") or "").strip(),
             }
         )

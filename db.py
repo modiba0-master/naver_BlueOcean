@@ -247,7 +247,7 @@ def query_top_keywords(
                 FROM keyword_metrics km
                 JOIN analysis_runs ar ON ar.id = km.run_id
                 {where_sql}
-                ORDER BY km.blue_ocean_score DESC, ar.started_at DESC
+                ORDER BY km.monthly_search_volume_est DESC, km.blue_ocean_score DESC, ar.started_at DESC
                 LIMIT %s
                 """,
                 tuple(params),
@@ -305,7 +305,7 @@ def query_report_metrics_full(
                 FROM keyword_metrics km
                 JOIN analysis_runs ar ON ar.id = km.run_id
                 {where_sql}
-                ORDER BY km.blue_ocean_score DESC, ar.started_at DESC
+                ORDER BY km.monthly_search_volume_est DESC, km.blue_ocean_score DESC, ar.started_at DESC
                 LIMIT %s
                 """,
                 tuple(params),
@@ -376,7 +376,7 @@ def query_report_top_per_seed(
                     {inner_where}
                 ) ranked
                 WHERE ranked.rn <= %s
-                ORDER BY ranked.seed_keyword, ranked.blue_ocean_score DESC
+                ORDER BY ranked.monthly_search_volume_est DESC, ranked.blue_ocean_score DESC, ranked.seed_keyword
                 """,
                 tuple(params),
             )

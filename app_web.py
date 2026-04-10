@@ -219,6 +219,8 @@ def run() -> None:
             raw_rows = []
 
         if not report_df_db.empty:
+            if "월평균 검색수(추정)" in report_df_db.columns:
+                report_df_db = report_df_db.sort_values(by="월평균 검색수(추정)", ascending=False)
             st.subheader("템플릿 8열 형식")
             st.dataframe(report_df_db, use_container_width=True, hide_index=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M")

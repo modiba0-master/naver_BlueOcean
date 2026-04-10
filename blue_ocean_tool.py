@@ -706,14 +706,15 @@ class BlueOceanToolGUI:
             if not rows:
                 self.append_log("   - 조건에 맞는 데이터가 없습니다.")
                 return
-            self.append_log("No | 실행일시            | 키워드                    | 점수    | 검색량 | 상품수")
+            self.append_log("No | 실행일시            | 키워드                    | 점수(%)   | 검색량 | 상품수")
             self.append_log("-" * 88)
             for i, r in enumerate(rows[: min(len(rows), 20)], start=1):
                 dt = str(r["started_at"])[:19]
                 kw = str(r["keyword_text"])[:22].ljust(22)
+                score_pct = f"{float(r.get('blue_ocean_score', 0.0) or 0.0):.2f}%"
                 self.append_log(
                     f"{i:>2} | {dt} | {kw} | "
-                    f"{r['blue_ocean_score']:>6.4f} | {r['monthly_search_volume_est']:>5} | {r['product_count']:>6}"
+                    f"{score_pct:>8} | {r['monthly_search_volume_est']:>5} | {r['product_count']:>6}"
                 )
             if len(rows) > 20:
                 self.append_log(f"... (총 {len(rows)}건 중 상위 20건만 표시)")
