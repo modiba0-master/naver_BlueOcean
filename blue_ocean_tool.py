@@ -4,8 +4,10 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 import sys
+import subprocess
 import threading
 import queue
+import socket
 from tkinter import messagebox
 import hmac
 import hashlib
@@ -782,26 +784,67 @@ class BlueOceanToolGUI:
     def mainloop(self):
         self.app.mainloop()
 
-if __name__ == "__main__":
-    try:
-        tool = BlueOceanTool()
-    except Exception as e:
-        print(f"\n오류 발생: {e}")
-        raise
 
-    # GUI 모드: 기본 실행은 GUI로 전환(콘솔은 --cli 옵션일 때)
-    if "--cli" in sys.argv or ctk is None:
-        # 한글 인코딩(콘솔용)
-        if sys.stdout.encoding != 'utf-8':
-            try:
-                import io
-                sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-            except Exception:
-                pass
+def launch_web_mode():
+    app_path = resource_path("app_web.py")
+    requested_port = str(os.environ.get("PORT", "8501")).strip() or "8501"
+    try:
+        base_port = int(requested_port)
+    except Exception:
+        base_port = 8501
+
+    port = base_port
+    for p in range(base_port, base_port + 20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if s.connect_ex(("127.0.0.1", p)) != 0:
+                port = p
+                break
+
+    env = os.environ.copy()
+    env["STREAMLIT_SERVER_HEADLESS"] = "true"
+    env["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        app_path,
+        "--server.address",
+        "0.0.0.0",
+        "--server.port",
+        str(port),
+        "--server.headless",
+        "true",
+        "--browser.gatherUsageStats",
+        "false",
+    ]
+    subprocess.call(cmd, env=env)
+
+
+if __name__ == "__main__":
+    # 기본 실행은 웹(Streamlit)으로 고정하고, 필요 시 데스크톱/CLI 옵션을 사용한다.
+    if "--desktop" not in sys.argv and "--cli" not in sys.argv:
+        launch_web_mode()
+    else:
         try:
-            tool.start_analysis()
+            tool = BlueOceanTool()
         except Exception as e:
             print(f"\n오류 발생: {e}")
-    else:
-        gui = BlueOceanToolGUI(tool)
-        gui.mainloop()
+            raise
+
+        if "--cli" in sys.argv or ctk is None:
+            # 한글 인코딩(콘솔용)
+            if sys.stdout.encoding != 'utf-8':
+                try:
+                    import io
+                    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+                except Exception:
+                    pass
+            try:
+                tool.start_analysis()
+            except Exception as e:
+                print(f"\n오류 발생: {e}")
+        else:
+            gui = BlueOceanToolGUI(tool)
+            gui.mainloop()
