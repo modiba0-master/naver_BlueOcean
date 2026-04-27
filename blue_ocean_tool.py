@@ -305,6 +305,8 @@ class BlueOceanTool:
         trends_by_keyword: Dict[str, Dict[str, Dict[str, float]]] = {}
         mode = str(analysis_mode or "precise").strip().lower()
         is_fast_mode = mode in {"fast", "quick", "빠른", "빠른모드"}
+        product_info_cache: Dict[str, tuple[int, str]] = {}
+        trends_cache: Dict[str, Dict[str, float]] = {}
 
         def clean_val(v):
             if isinstance(v, str) and "<" in v:
@@ -313,6 +315,25 @@ class BlueOceanTool:
                 return float(v) if v is not None else 0.0
             except Exception:
                 return 0.0
+
+        def normalize_keyword(text: str) -> str:
+            return "".join(str(text or "").split()).lower()
+
+        def cached_product_info(keyword: str) -> tuple[int, str]:
+            key = normalize_keyword(keyword)
+            if key in product_info_cache:
+                return product_info_cache[key]
+            info = self.get_product_info(keyword)
+            product_info_cache[key] = info
+            return info
+
+        def cached_monthly_trends(keyword: str) -> Dict[str, float]:
+            cache_key = f"{normalize_keyword(keyword)}::{start_date}::{end_date}"
+            if cache_key in trends_cache:
+                return trends_cache[cache_key]
+            tr = self.get_monthly_trends(keyword, start_date, end_date)
+            trends_cache[cache_key] = tr
+            return tr
 
         for seed in seeds:
             seed = str(seed).strip()
@@ -328,7 +349,7 @@ class BlueOceanTool:
             seed_category_hint = ""
             candidate_keywords = raw_keywords
             if is_fast_mode:
-                _, seed_category_hint = self.get_product_info(seed)
+                _, seed_category_hint = cached_product_info(seed)
                 ranked_candidates = sorted(
                     raw_keywords,
                     key=lambda x: (
@@ -336,7 +357,8 @@ class BlueOceanTool:
                     ),
                     reverse=True,
                 )
-                candidate_keywords = ranked_candidates[:250]
+                # 빠른 모드 강한 조기탈락: 상위 120개만 후보로 제한
+                candidate_keywords = ranked_candidates[:120]
                 log(
                     f"ㄴ 빠른 모드: {len(raw_keywords)}개 중 상위 {len(candidate_keywords)}개 후보 우선 분석"
                     + (f" (카테고리 힌트: {seed_category_hint})" if seed_category_hint else "")
@@ -344,7 +366,20 @@ class BlueOceanTool:
             else:
                 log(f"ㄴ {len(raw_keywords)}개 연관 키워드 전수 분석 시작... (약 1~2분 소요)")
 
-            for idx, item in enumerate(candidate_keywords):
+            # 동일 의미 키워드 중복 제거(공백/대소문자 차이 제거)
+            deduped_candidates = []
+            seen_kw = set()
+            for item in candidate_keywords:
+                norm_kw = normalize_keyword(item.get("relKeyword", ""))
+                if not norm_kw or norm_kw in seen_kw:
+                    continue
+                seen_kw.add(norm_kw)
+                deduped_candidates.append(item)
+
+            if is_fast_mode:
+                log(f"ㄴ 중복 제거 후 {len(deduped_candidates)}개 후보 분석")
+
+            for idx, item in enumerate(deduped_candidates):
                 kw = item['relKeyword']
 
                 pc_qc = clean_val(item.get("monthlyPcQcCnt"))
@@ -357,8 +392,12 @@ class BlueOceanTool:
 
                 total_clk = clean_val(item.get("monthlyAvePcClkCnt")) + clean_val(item.get("monthlyAveMobileClkCnt"))
 
+                # 빠른 모드 추가 조기탈락: 클릭 추정이 너무 낮은 키워드 제외
+                if is_fast_mode and total_clk < 10:
+                    continue
+
                 # 쇼핑 상품 수/카테고리 조회
-                prod_count, kw_category = self.get_product_info(kw)
+                prod_count, kw_category = cached_product_info(kw)
                 time.sleep(0.02)
 
                 # 빠른 모드: 주제어 카테고리와 괴리가 큰 키워드는 제외
@@ -374,7 +413,7 @@ class BlueOceanTool:
 
                 # 상위 유망 후보군만 상세 기간 분석 진행 (API 할당량 절약)
                 if blue_ocean_score > 0.5:
-                    trends = self.get_monthly_trends(kw, start_date, end_date)
+                    trends = cached_monthly_trends(kw)
                     if not trends:
                         continue
 
@@ -412,7 +451,7 @@ class BlueOceanTool:
                     }
 
                 if idx % 50 == 0:
-                    log(f"   - {idx}/{len(candidate_keywords)} 진행 중...")
+                    log(f"   - {idx}/{len(deduped_candidates)} 진행 중...")
 
         if all_results:
             df = pd.DataFrame(all_results).sort_values(by="블루오션 점수", ascending=False).head(100)  # 상위 100개만 리포트
