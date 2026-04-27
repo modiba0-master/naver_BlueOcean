@@ -72,3 +72,60 @@
   - 수요강도 내 CTR 가중 비율
   - 빠른/정밀 모드 deep_limit 조정
 
+---
+
+## 7) 2026-04-27 심야 추가 반영 사항 (최신)
+
+- 대시보드 `최근 DB 결과 조회`를 `시장성 점수 조회 (DB)`로 전환
+  - 점수식: `수요 × 트렌드 × 전환 ÷ 경쟁`
+  - 구성 점수 컬럼(수요/트렌드/전환/경쟁/최종) 표시
+- `keyword_metrics`에 쿠팡 지표 저장 컬럼 확장
+  - `top10_avg_reviews`, `top10_avg_price`
+- 쿠팡 크롤러 모듈 분리/도입
+  - 신규 파일: `coupang_crawler.py`
+  - `blue_ocean_tool.py`는 해당 모듈 호출 방식으로 치환
+- 성능/복잡도 간소화 적용
+  - 호출 순서: `cache -> requests(retry1) -> selenium fallback`
+  - Selenium 랜덤 대기 축소 (`1.0~2.0s`)
+  - 운영 기본 `HEADLESS=True`
+  - `blue_ocean_tool.py` 내부 중복 쿠팡 캐시 제거
+- 관리자 인증 게이트 추가
+  - `app_web.py`에서 로그인 전 대시보드 접근 차단
+  - 필요 환경변수: `MODIBA_ADMIN_ID`, `MODIBA_ADMIN_PASSWORD`
+  - 로그인/로그아웃 흐름 추가
+- 쿠팡 로그인 세션 2단계 운영 지원
+  - 1단계(1회): 전용 프로필로 수동 로그인 세션 저장
+  - 2단계(운영): headless 재사용 실행
+  - 가이드 문서: `docs/coupang_login_session_guide.md`
+
+## 8) 현재 확인된 이슈/원인
+
+- 쿠팡 값 미표시는 대시보드 문제가 아니라 **크롤러 수집 실패**가 원인
+  - requests 경로: `403`
+  - selenium 경로: `Access Denied` + `TimeoutException`
+- 로그인 세션 재사용 테스트 중 확인된 추가 이슈
+  - 기존 사용자 프로필 재사용 시 `DevToolsActivePort` 크래시 가능
+  - 전용 프로필 경로 사용으로 충돌 위험 완화
+
+## 9) 다음 호출 즉시 실행 체크리스트
+
+1. Railway 변수 점검
+   - `MODIBA_ADMIN_ID`, `MODIBA_ADMIN_PASSWORD`
+   - (선택) `COUPANG_CHROME_USER_DATA_DIR`, `COUPANG_CHROME_PROFILE`, `COUPANG_HEADLESS`
+2. 로컬에서 1회 로그인 세션 저장
+   - `python .\coupang_crawler.py --bootstrap-login --wait-seconds 180`
+3. 운영 모드 테스트
+   - `python .\coupang_crawler.py --keyword "돼지족발"`
+4. 분석 실행 후 로그 확인
+   - `cache_hit`, `requests_ok`, `selenium_ok`, `failed`, `success_rate`
+5. 쿠팡 값 미수집 지속 시
+   - 점수 테이블에서 쿠팡 항목 `N/A` 표기 전략 검토
+   - 접근 정책(프록시/공식 API 대체) 의사결정 필요
+
+## 10) 최신 커밋 체인 (마감 시점)
+
+- `148c5af`: 관리자 로그인 게이트 적용
+- `e407809`: 쿠팡 로그인 세션 부트스트랩 + 운영 가이드
+- `ab1fca7`: 쿠팡 크롤러 모듈화 및 흐름 간소화
+- `0d66deb`: 시장성 점수 대시보드 + 쿠팡 전환 지표 연동
+
