@@ -4,3 +4,5 @@ pymysql
 openpyxl
 streamlit
 xlrd
+beautifulsoup4
+selenium

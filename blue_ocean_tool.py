@@ -1,5 +1,4 @@
 import os
-import re
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -19,6 +18,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 from report_format import finalize_analysis_dataframe
+from coupang_crawler import get_shared_crawler
 
 try:
     import customtkinter as ctk
@@ -100,6 +100,7 @@ class BlueOceanTool:
             "Content-Type": "application/json"
         }
         self.ads_api = NaverSearchAdsAPI(self.config['naver_ads_api'])
+        self.coupang_crawler = get_shared_crawler()
         self.output_dir = self.config['settings']['output_dir']
         self.save_excel = bool(self.config.get("settings", {}).get("save_excel", False))
         self.db_enabled = bool(self.config.get("settings", {}).get("db_enabled", True))
@@ -198,52 +199,12 @@ class BlueOceanTool:
         return total
 
     def get_coupang_top10_stats(self, keyword: str) -> tuple[Optional[float], Optional[float]]:
-        """
-        쿠팡 검색 결과 페이지에서 상위 10개 상품의 평균 리뷰수/평균 가격을 추정한다.
-        수집 실패 시 (None, None) 반환.
-        """
-        q = str(keyword or "").strip()
-        if not q:
-            return None, None
-
-        url = f"https://www.coupang.com/np/search?component=&q={requests.utils.quote(q)}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        }
         try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code != 200:
+            data = self.coupang_crawler.crawl_coupang(keyword)
+            avg_reviews = float(data.get("avg_reviews", 0.0) or 0.0)
+            avg_price = float(data.get("avg_price", 0.0) or 0.0)
+            if avg_reviews <= 0 or avg_price <= 0:
                 return None, None
-            html = res.text
-
-            # 검색 결과의 JSON 블록에서 price/reviewCount를 파싱한다.
-            price_vals: List[float] = []
-            review_vals: List[float] = []
-
-            price_matches = re.findall(r'"salePrice"\s*:\s*([0-9]+)', html)
-            review_matches = re.findall(r'"ratingCount"\s*:\s*([0-9]+)', html)
-
-            for p in price_matches[:10]:
-                try:
-                    pv = float(p)
-                    if pv > 0:
-                        price_vals.append(pv)
-                except Exception:
-                    continue
-
-            for rv in review_matches[:10]:
-                try:
-                    review_vals.append(float(rv))
-                except Exception:
-                    continue
-
-            if not price_vals:
-                return None, None
-
-            avg_price = round(sum(price_vals) / len(price_vals), 2)
-            avg_reviews = round(sum(review_vals) / len(review_vals), 2) if review_vals else 0.0
             return avg_reviews, avg_price
         except Exception:
             return None, None
@@ -400,7 +361,6 @@ class BlueOceanTool:
         parsed_start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
         parsed_end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
         product_info_cache: Dict[str, tuple[int, str]] = {}
-        coupang_stats_cache: Dict[str, tuple[Optional[float], Optional[float]]] = {}
         trends_cache: Dict[str, Dict[str, float]] = {}
 
         def clean_val(v):
@@ -429,14 +389,6 @@ class BlueOceanTool:
             tr = self.get_monthly_trends(keyword, start_date, end_date)
             trends_cache[cache_key] = tr
             return tr
-
-        def cached_coupang_stats(keyword: str) -> tuple[Optional[float], Optional[float]]:
-            key = normalize_keyword(keyword)
-            if key in coupang_stats_cache:
-                return coupang_stats_cache[key]
-            stats = self.get_coupang_top10_stats(keyword)
-            coupang_stats_cache[key] = stats
-            return stats
 
         for seed in seeds:
             seed = str(seed).strip()
@@ -573,7 +525,7 @@ class BlueOceanTool:
                         demand = math.log1p(max(0.0, avg_qc)) * (1.0 + max(0.0, avg_ctr) / 100.0)
                         raw_score = (demand / max(1.0, competition)) * 100.0
 
-                    top10_avg_reviews, top10_avg_price = cached_coupang_stats(kw)
+                    top10_avg_reviews, top10_avg_price = self.get_coupang_top10_stats(kw)
 
                 all_results.append({
                     "주제어": seed,
@@ -643,6 +595,21 @@ class BlueOceanTool:
                 report_df.to_excel(filepath, index=False, engine="openpyxl")
 
             log("\n✨ 분석이 완료되었습니다!")
+            try:
+                cs = self.coupang_crawler.get_stats()
+                success_rate = float(cs.get("selenium_ok", 0)) / max(
+                    1, float(cs.get("selenium_ok", 0) + cs.get("failed", 0))
+                )
+                log(
+                    "🧪 쿠팡 크롤링 통계: "
+                    f"cache_hit={cs.get('cache_hit', 0)}, "
+                    f"requests_ok={cs.get('requests_ok', 0)}, "
+                    f"selenium_ok={cs.get('selenium_ok', 0)}, "
+                    f"failed={cs.get('failed', 0)}, "
+                    f"success_rate={success_rate:.2f}"
+                )
+            except Exception:
+                pass
             if filepath:
                 log(f"📁 리포트 저장 위치: {filepath}")
             else:
