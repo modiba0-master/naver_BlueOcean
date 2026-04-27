@@ -16,3 +16,23 @@ alwaysApply: true
   - 500: check server-side/runtime first
 - Security: never expose API keys; never log sensitive data.
 - Prioritize stability over speed in every change.
+
+## End-of-day fixed format (mandatory)
+
+When user says any close-out intent (examples: "하루 마감", "오늘 종료", "커서 종료", "마감 정리", "마무리"), always output the following fixed format before ending:
+
+1) 오늘 작업 요약
+- 완료 항목
+- 미완료/보류 항목
+
+2) 변경 내역
+- 수정 파일 목록
+- 커밋/푸시/배포 여부
+
+3) 운영 체크
+- 서비스 URL 상태
+- DB/로그 확인 결과
+
+4) 다음 시작 TODO
+- 다음 우선 작업 1~3개
+- 위험/확인 필요 사항

@@ -1,11 +1,13 @@
 import os
+from collections import Counter
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import pandas as pd
+import requests
 import streamlit as st
 
-from blue_ocean_tool import BlueOceanTool, resource_path
+from blue_ocean_tool import BlueOceanTool
 from db import query_report_metrics_full, query_report_top_per_seed
 from report_format import dataframe_from_db_metric_rows, report_to_excel_bytes
 
@@ -34,69 +36,47 @@ def get_tool() -> BlueOceanTool:
 
 
 @st.cache_data
-def load_category_hierarchy() -> Tuple[List[str], Dict[str, List[str]], Dict[tuple, List[str]], Dict[tuple, List[str]], str]:
-    level1_options: List[str] = []
-    level2_map: Dict[str, List[str]] = {}
-    level3_map: Dict[tuple, List[str]] = {}
-    level4_map: Dict[tuple, List[str]] = {}
-    load_message = ""
+def detect_naver_categories(seed_keyword: str, client_id: str, client_secret: str) -> Tuple[List[str], str]:
+    seed = str(seed_keyword).strip()
+    if not seed:
+        return [], "주제어를 먼저 입력해주세요."
 
-    candidate_paths = [
-        resource_path("category_naver.xls"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "category_naver.xls"),
-        os.path.join(os.getcwd(), "category_naver.xls"),
-    ]
-    path = next((p for p in candidate_paths if os.path.exists(p)), "")
-    if not path:
-        return level1_options, level2_map, level3_map, level4_map, "파일 경로를 찾지 못했습니다."
+    if not client_id or not client_secret:
+        return [], "네이버 Open API 인증 정보가 없습니다."
+
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret,
+    }
+    url = "https://openapi.naver.com/v1/search/shop.json"
+    params = {"query": seed, "display": 50, "sort": "sim"}
+
     try:
-        df = pd.read_excel(path)
-        if df.shape[1] < 5:
-            return level1_options, level2_map, level3_map, level4_map, "엑셀 열 구조가 예상과 다릅니다."
-        category_df = df.iloc[:, 1:5].fillna("")
-        for _, row in category_df.iterrows():
-            l1, l2, l3, l4 = [str(v).strip() for v in row.tolist()]
-            if not l1:
-                continue
-            if l1 not in level1_options:
-                level1_options.append(l1)
-            if l2:
-                level2_map.setdefault(l1, [])
-                if l2 not in level2_map[l1]:
-                    level2_map[l1].append(l2)
-            if l2 and l3:
-                key3 = (l1, l2)
-                level3_map.setdefault(key3, [])
-                if l3 not in level3_map[key3]:
-                    level3_map[key3].append(l3)
-            if l2 and l3 and l4:
-                key4 = (l1, l2, l3)
-                level4_map.setdefault(key4, [])
-                if l4 not in level4_map[key4]:
-                    level4_map[key4].append(l4)
-    except Exception:
-        return [], {}, {}, {}, f"엑셀 로딩 실패: {path}"
-    load_message = f"카테고리 파일 로드됨: {path}"
-    return level1_options, level2_map, level3_map, level4_map, load_message
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+        if res.status_code != 200:
+            return [], f"카테고리 탐색 실패: HTTP {res.status_code}"
+        items = res.json().get("items", [])
+    except Exception as e:
+        return [], f"카테고리 탐색 오류: {e}"
 
+    if not items:
+        return [], "검색 결과가 없어 카테고리를 찾지 못했습니다."
 
-def _pick_selected_category_keyword(l1: str, l2: str, l3: str, l4: str) -> str:
-    for v in [l4, l3, l2, l1]:
-        if v and v not in {"-", "데이터 없음"}:
-            return v
-    return ""
+    category_counter: Counter[str] = Counter()
+    for it in items:
+        c1 = str(it.get("category1", "")).strip()
+        c2 = str(it.get("category2", "")).strip()
+        c3 = str(it.get("category3", "")).strip()
+        c4 = str(it.get("category4", "")).strip()
+        cats = [c for c in [c1, c2, c3, c4] if c]
+        if cats:
+            category_counter[" > ".join(cats)] += 1
 
+    if not category_counter:
+        return [], "카테고리 정보가 포함된 상품이 없어 표시할 수 없습니다."
 
-def _sync_seed_in_session(selected: str):
-    current = st.session_state.get("seed_input", "")
-    parts = [p.strip() for p in str(current).split(",") if p.strip()]
-    prev_auto = st.session_state.get("auto_category_seed_web")
-    if prev_auto and prev_auto in parts:
-        parts = [p for p in parts if p != prev_auto]
-    if selected and selected not in parts:
-        parts.append(selected)
-    st.session_state["seed_input"] = ", ".join(parts)
-    st.session_state["auto_category_seed_web"] = selected or None
+    top_categories = [f"{cat} ({cnt}건)" for cat, cnt in category_counter.most_common(8)]
+    return top_categories, "주제어 기반 카테고리 탐색 완료"
 
 
 def run() -> None:
@@ -106,27 +86,34 @@ def run() -> None:
 
     if "seed_input" not in st.session_state:
         st.session_state["seed_input"] = "축산물, 정육"
-    if "auto_category_seed_web" not in st.session_state:
-        st.session_state["auto_category_seed_web"] = None
+    if "detected_categories" not in st.session_state:
+        st.session_state["detected_categories"] = []
+    if "detected_category_msg" not in st.session_state:
+        st.session_state["detected_category_msg"] = ""
 
     with st.sidebar:
         st.subheader("실행 설정")
-        st.caption("네이버 카테고리 필터")
-        level1_options, level2_map, level3_map, level4_map, load_message = load_category_hierarchy()
-        if level1_options:
-            st.caption(load_message)
-            l1 = st.selectbox("대분류", level1_options, key="cat_l1_web")
-            l2_values = level2_map.get(l1, []) or ["-"]
-            l2 = st.selectbox("중분류", l2_values, key="cat_l2_web")
-            l3_values = level3_map.get((l1, l2), []) or ["-"]
-            l3 = st.selectbox("소분류", l3_values, key="cat_l3_web")
-            l4_values = level4_map.get((l1, l2, l3), []) or ["-"]
-            l4 = st.selectbox("세분류", l4_values, key="cat_l4_web")
-            _sync_seed_in_session(_pick_selected_category_keyword(l1, l2, l3, l4))
-        else:
-            st.warning(f"카테고리 필터를 표시할 수 없습니다. ({load_message})")
-
         seeds_text = st.text_input("주제어(쉼표로 구분)", key="seed_input")
+        detect_clicked = st.button("주제어 기반 카테고리 찾기", use_container_width=True)
+        if detect_clicked:
+            first_seed = str(seeds_text).split(",")[0].strip() if seeds_text else ""
+            client_id = str(os.getenv("NAVER_CLIENT_ID", "")).strip() or str(
+                get_tool().config.get("naver_open_api", {}).get("client_id", "")
+            ).strip()
+            client_secret = str(os.getenv("NAVER_CLIENT_SECRET", "")).strip() or str(
+                get_tool().config.get("naver_open_api", {}).get("client_secret", "")
+            ).strip()
+            detected, msg = detect_naver_categories(first_seed, client_id, client_secret)
+            st.session_state["detected_categories"] = detected
+            st.session_state["detected_category_msg"] = msg
+
+        if st.session_state.get("detected_category_msg"):
+            st.caption(st.session_state["detected_category_msg"])
+        if st.session_state.get("detected_categories"):
+            st.markdown("**네이버 쇼핑 노출 카테고리(추정)**")
+            for row in st.session_state["detected_categories"]:
+                st.write(f"- {row}")
+
         default_end = date.today()
         default_start = default_end - timedelta(days=120)
         start_date = st.date_input("분석 시작일", value=default_start)
