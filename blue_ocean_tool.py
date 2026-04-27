@@ -8,6 +8,7 @@ import subprocess
 import threading
 import queue
 import socket
+from collections import Counter
 from tkinter import messagebox
 import hmac
 import hashlib
@@ -346,10 +347,9 @@ class BlueOceanTool:
                 log(f"❌ [{seed}] 관련 키워드를 찾지 못했습니다.")
                 continue
 
-            seed_category_hint = ""
             candidate_keywords = raw_keywords
+            discovered_category_counter: Counter[str] = Counter()
             if is_fast_mode:
-                _, seed_category_hint = cached_product_info(seed)
                 ranked_candidates = sorted(
                     raw_keywords,
                     key=lambda x: (
@@ -361,7 +361,6 @@ class BlueOceanTool:
                 candidate_keywords = ranked_candidates[:120]
                 log(
                     f"ㄴ 빠른 모드: {len(raw_keywords)}개 중 상위 {len(candidate_keywords)}개 후보 우선 분석"
-                    + (f" (카테고리 힌트: {seed_category_hint})" if seed_category_hint else "")
                 )
             else:
                 log(f"ㄴ {len(raw_keywords)}개 연관 키워드 전수 분석 시작... (약 1~2분 소요)")
@@ -400,12 +399,11 @@ class BlueOceanTool:
                 prod_count, kw_category = cached_product_info(kw)
                 time.sleep(0.02)
 
-                # 빠른 모드: 주제어 카테고리와 괴리가 큰 키워드는 제외
-                if is_fast_mode and seed_category_hint and kw_category:
-                    seed_top = " > ".join(seed_category_hint.split(" > ")[:2])
+                # 주제어 기반이 아닌, 실행 중 새롭게 탐색된 카테고리를 우선 기준으로 축적
+                if kw_category:
                     kw_top = " > ".join(kw_category.split(" > ")[:2])
-                    if seed_top and kw_top and seed_top != kw_top:
-                        continue
+                    if kw_top:
+                        discovered_category_counter[kw_top] += 1
 
                 # 블루오션 점수 (최신 한 달 기준 1차 필터링)
                 safe_total = prod_count if prod_count > 0 else 1
@@ -452,6 +450,7 @@ class BlueOceanTool:
 
                 if idx % 50 == 0:
                     log(f"   - {idx}/{len(deduped_candidates)} 진행 중...")
+
 
         if all_results:
             df = pd.DataFrame(all_results).sort_values(by="블루오션 점수", ascending=False).head(100)  # 상위 100개만 리포트
