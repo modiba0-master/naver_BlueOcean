@@ -164,13 +164,33 @@ class BlueOceanTool:
             return {}
         except: return {}
 
-    def get_product_count(self, keyword):
+    def get_product_info(self, keyword) -> tuple[int, str]:
         url = f"https://openapi.naver.com/v1/search/shop.json?query={keyword}&display=1"
         try:
             res = requests.get(url, headers=self.open_headers)
-            if res.status_code == 200: return res.json().get('total', 0)
-            return 0
-        except: return 0
+            if res.status_code == 200:
+                payload = res.json()
+                total = int(payload.get("total", 0) or 0)
+                items = payload.get("items", []) or []
+                if items:
+                    it = items[0]
+                    cats = [
+                        str(it.get("category1", "")).strip(),
+                        str(it.get("category2", "")).strip(),
+                        str(it.get("category3", "")).strip(),
+                        str(it.get("category4", "")).strip(),
+                    ]
+                    cat_path = " > ".join([c for c in cats if c])
+                else:
+                    cat_path = ""
+                return total, cat_path
+            return 0, ""
+        except Exception:
+            return 0, ""
+
+    def get_product_count(self, keyword):
+        total, _ = self.get_product_info(keyword)
+        return total
 
     def _strategy_text(self, blue_ocean_score: float) -> str:
         if blue_ocean_score > 5:
@@ -240,6 +260,7 @@ class BlueOceanTool:
         seeds=None,
         start_date=None,
         end_date=None,
+        analysis_mode: str = "precise",
         log_callback=None,
     ) -> Tuple[Optional[str], Optional[pd.DataFrame]]:
         """
@@ -282,6 +303,16 @@ class BlueOceanTool:
         log("\n✅ 설정을 확인했습니다. 엔진을 구동합니다...")
         all_results = []
         trends_by_keyword: Dict[str, Dict[str, Dict[str, float]]] = {}
+        mode = str(analysis_mode or "precise").strip().lower()
+        is_fast_mode = mode in {"fast", "quick", "빠른", "빠른모드"}
+
+        def clean_val(v):
+            if isinstance(v, str) and "<" in v:
+                return 5.0
+            try:
+                return float(v) if v is not None else 0.0
+            except Exception:
+                return 0.0
 
         for seed in seeds:
             seed = str(seed).strip()
@@ -294,19 +325,27 @@ class BlueOceanTool:
                 log(f"❌ [{seed}] 관련 키워드를 찾지 못했습니다.")
                 continue
 
-            log(f"ㄴ {len(raw_keywords)}개 연관 키워드 전수 분석 시작... (약 1~2분 소요)")
+            seed_category_hint = ""
+            candidate_keywords = raw_keywords
+            if is_fast_mode:
+                _, seed_category_hint = self.get_product_info(seed)
+                ranked_candidates = sorted(
+                    raw_keywords,
+                    key=lambda x: (
+                        clean_val(x.get("monthlyPcQcCnt")) + clean_val(x.get("monthlyMobileQcCnt"))
+                    ),
+                    reverse=True,
+                )
+                candidate_keywords = ranked_candidates[:250]
+                log(
+                    f"ㄴ 빠른 모드: {len(raw_keywords)}개 중 상위 {len(candidate_keywords)}개 후보 우선 분석"
+                    + (f" (카테고리 힌트: {seed_category_hint})" if seed_category_hint else "")
+                )
+            else:
+                log(f"ㄴ {len(raw_keywords)}개 연관 키워드 전수 분석 시작... (약 1~2분 소요)")
 
-            for idx, item in enumerate(raw_keywords):
+            for idx, item in enumerate(candidate_keywords):
                 kw = item['relKeyword']
-
-                # 기본 필터링: 검색량이 너무 적은 것은 제외
-                def clean_val(v):
-                    if isinstance(v, str) and "<" in v:
-                        return 5.0
-                    try:
-                        return float(v) if v is not None else 0.0
-                    except Exception:
-                        return 0.0
 
                 pc_qc = clean_val(item.get("monthlyPcQcCnt"))
                 mo_qc = clean_val(item.get("monthlyMobileQcCnt"))
@@ -318,9 +357,16 @@ class BlueOceanTool:
 
                 total_clk = clean_val(item.get("monthlyAvePcClkCnt")) + clean_val(item.get("monthlyAveMobileClkCnt"))
 
-                # 쇼핑 상품 수 조회
-                prod_count = self.get_product_count(kw)
+                # 쇼핑 상품 수/카테고리 조회
+                prod_count, kw_category = self.get_product_info(kw)
                 time.sleep(0.02)
+
+                # 빠른 모드: 주제어 카테고리와 괴리가 큰 키워드는 제외
+                if is_fast_mode and seed_category_hint and kw_category:
+                    seed_top = " > ".join(seed_category_hint.split(" > ")[:2])
+                    kw_top = " > ".join(kw_category.split(" > ")[:2])
+                    if seed_top and kw_top and seed_top != kw_top:
+                        continue
 
                 # 블루오션 점수 (최신 한 달 기준 1차 필터링)
                 safe_total = prod_count if prod_count > 0 else 1
@@ -366,7 +412,7 @@ class BlueOceanTool:
                     }
 
                 if idx % 50 == 0:
-                    log(f"   - {idx}/{len(raw_keywords)} 진행 중...")
+                    log(f"   - {idx}/{len(candidate_keywords)} 진행 중...")
 
         if all_results:
             df = pd.DataFrame(all_results).sort_values(by="블루오션 점수", ascending=False).head(100)  # 상위 100개만 리포트

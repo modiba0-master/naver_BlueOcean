@@ -115,9 +115,10 @@ def run() -> None:
                 st.write(f"- {row}")
 
         default_end = date.today()
-        default_start = default_end - timedelta(days=120)
+        default_start = default_end - timedelta(days=60)
         start_date = st.date_input("분석 시작일", value=default_start)
         end_date = st.date_input("분석 종료일", value=default_end)
+        mode_label = st.selectbox("분석 모드", ["빠른 모드", "정밀 모드"], index=0)
         run_clicked = st.button("분석 실행", type="primary", use_container_width=True)
 
         st.divider()
@@ -140,10 +141,12 @@ def run() -> None:
                     logs.append(msg)
 
                 with st.spinner("분석 중입니다. API 호출량에 따라 시간이 걸릴 수 있습니다."):
+                    mode_value = "fast" if mode_label == "빠른 모드" else "precise"
                     summary, report_df = tool.start_analysis(
                         seeds=seeds_text,
                         start_date=start_date.strftime("%Y-%m-%d"),
                         end_date=end_date.strftime("%Y-%m-%d"),
+                        analysis_mode=mode_value,
                         log_callback=_log,
                     )
                 st.code("\n".join(logs) if logs else "로그 없음")
