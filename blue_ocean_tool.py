@@ -194,9 +194,9 @@ class BlueOceanTool:
         return total
 
     def _strategy_text(self, blue_ocean_score: float) -> str:
-        if blue_ocean_score > 5:
+        if blue_ocean_score >= 70:
             return "강력 추천 황금 키워드! 수요 대비 경쟁자가 매우 적습니다."
-        if blue_ocean_score > 1:
+        if blue_ocean_score >= 40:
             return "유망 키워드. 썸네일과 상세페이지 차별화 추천."
         return "경쟁이 있으나 틈새 시장 공략이 가능합니다."
 
@@ -352,9 +352,7 @@ class BlueOceanTool:
             if is_fast_mode:
                 ranked_candidates = sorted(
                     raw_keywords,
-                    key=lambda x: (
-                        clean_val(x.get("monthlyPcQcCnt")) + clean_val(x.get("monthlyMobileQcCnt"))
-                    ),
+                    key=lambda x: clean_val(x.get("monthlyMobileQcCnt")),
                     reverse=True,
                 )
                 # 빠른 모드 강한 조기탈락: 상위 120개만 후보로 제한
@@ -381,15 +379,14 @@ class BlueOceanTool:
             for idx, item in enumerate(deduped_candidates):
                 kw = item['relKeyword']
 
-                pc_qc = clean_val(item.get("monthlyPcQcCnt"))
                 mo_qc = clean_val(item.get("monthlyMobileQcCnt"))
-                total_qc = pc_qc + mo_qc
+                total_qc = mo_qc
 
                 # 최소 검색량 필터링 (가독성을 위해 500회 이상만)
                 if total_qc < 500:
                     continue
 
-                total_clk = clean_val(item.get("monthlyAvePcClkCnt")) + clean_val(item.get("monthlyAveMobileClkCnt"))
+                total_clk = clean_val(item.get("monthlyAveMobileClkCnt"))
 
                 # 빠른 모드 추가 조기탈락: 클릭 추정이 너무 낮은 키워드 제외
                 if is_fast_mode and total_clk < 10:
@@ -424,8 +421,8 @@ class BlueOceanTool:
                     avg_clk = sum(est_vols_clk) / len(trends)
                     avg_ctr = (sum(est_vols_clk) / sum(est_vols_qc) * 100) if sum(est_vols_qc) > 0 else 0
 
-                    # 기간 평균 기준 최종 점수 재산출
-                    final_score = (avg_clk / safe_total) * 10000
+                    # 기간 평균 기준 원점수 재산출(추후 100점 만점 환산)
+                    raw_score = (avg_clk / safe_total) * 10000
 
                     trends_by_keyword[kw] = {
                         m: {
@@ -440,7 +437,7 @@ class BlueOceanTool:
                     avg_qc = total_qc
                     avg_clk = total_clk
                     avg_ctr = (total_clk / total_qc * 100) if total_qc > 0 else 0
-                    final_score = blue_ocean_score
+                    raw_score = blue_ocean_score
 
                 all_results.append({
                     "주제어": seed,
@@ -449,7 +446,8 @@ class BlueOceanTool:
                     "월평균 클릭수(추정)": round(avg_clk, 1),
                     "평균 클릭율(CTR)": f"{round(avg_ctr, 2)}%",
                     "상품수": prod_count,
-                    "블루오션 점수": round(final_score, 4)
+                    "_raw_score": float(raw_score),
+                    "블루오션 점수": 0.0,
                 })
 
                 if idx % 50 == 0:
@@ -457,7 +455,24 @@ class BlueOceanTool:
 
 
         if all_results:
-            df = pd.DataFrame(all_results).sort_values(by="블루오션 점수", ascending=False).head(100)  # 상위 100개만 리포트
+            raw_scores = [float(r.get("_raw_score", 0.0) or 0.0) for r in all_results]
+            min_score = min(raw_scores) if raw_scores else 0.0
+            max_score = max(raw_scores) if raw_scores else 0.0
+            for r in all_results:
+                rs = float(r.get("_raw_score", 0.0) or 0.0)
+                if max_score > min_score:
+                    norm_score = ((rs - min_score) / (max_score - min_score)) * 100.0
+                else:
+                    norm_score = 100.0 if rs > 0 else 0.0
+                r["블루오션 점수"] = round(norm_score, 2)
+                r.pop("_raw_score", None)
+
+            df = (
+                pd.DataFrame(all_results)
+                .sort_values(by="블루오션 점수", ascending=False)
+                .head(50)
+                .sort_values(by="월평균 검색수(추정)", ascending=False)
+            )  # 점수 상위 50개 선별 후 모바일 검색수 내림차순 표시
 
             df["전략 제언"] = df["블루오션 점수"].apply(self._strategy_text)
             report_df = finalize_analysis_dataframe(df)
