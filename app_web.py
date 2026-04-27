@@ -8,8 +8,8 @@ import requests
 import streamlit as st
 
 from blue_ocean_tool import BlueOceanTool
-from db import query_report_metrics_full, query_report_top_per_seed
-from report_format import dataframe_from_db_metric_rows, report_to_excel_bytes
+from db import query_market_score_rows
+from report_format import report_to_excel_bytes
 
 
 def _period_to_range(label: str) -> Tuple[Optional[datetime], Optional[datetime]]:
@@ -85,7 +85,7 @@ def run() -> None:
     st.caption("Railway 웹서비스용 - 분석 실행 및 DB 결과 조회 (엑셀 템플릿 8열 형식)")
 
     if "seed_input" not in st.session_state:
-        st.session_state["seed_input"] = "축산물, 정육"
+        st.session_state["seed_input"] = ""
     if "detected_categories" not in st.session_state:
         st.session_state["detected_categories"] = []
     if "detected_category_msg" not in st.session_state:
@@ -170,7 +170,9 @@ def run() -> None:
             st.info("왼쪽 사이드바에서 조건을 설정하고 `분석 실행`을 눌러주세요.")
 
     with col2:
-        st.subheader("최근 DB 결과 조회")
+        st.subheader("시장성 점수 조회 (DB)")
+        st.caption("최종 점수 = 수요 점수 × 트렌드 점수 × 전환 점수 ÷ 경쟁 점수")
+
         filter_col1, filter_col2, filter_col3 = st.columns([2, 1, 1])
         with filter_col1:
             keyword_like = st.text_input("키워드 필터", value="")
@@ -179,52 +181,69 @@ def run() -> None:
         with filter_col3:
             limit = st.selectbox("건수", [20, 50, 100, 200], index=1)
 
-        top10_mode = st.checkbox("주제어별 상위 N건 (카테고리별 TOP10 스타일)", value=False)
-        top_n = 10
-        if top10_mode:
-            top_n = int(st.number_input("주제어당 건수", min_value=1, max_value=100, value=10))
-
         started_from, started_to = _period_to_range(period)
 
         try:
-            if top10_mode:
-                raw_rows = query_report_top_per_seed(
-                    top_n=top_n,
-                    keyword_like=(keyword_like or "").strip() or None,
-                    started_from=started_from,
-                    started_to=started_to,
-                )
-                report_df_db = dataframe_from_db_metric_rows(raw_rows)
-            else:
-                raw_rows = query_report_metrics_full(
-                    limit=int(limit),
-                    keyword_like=(keyword_like or "").strip() or None,
-                    started_from=started_from,
-                    started_to=started_to,
-                )
-                report_df_db = dataframe_from_db_metric_rows(raw_rows)
+            score_rows = query_market_score_rows(
+                limit=int(limit),
+                keyword_like=(keyword_like or "").strip() or None,
+                started_from=started_from,
+                started_to=started_to,
+            )
         except Exception as e:
             st.error(f"DB 조회 실패: {e}")
-            report_df_db = pd.DataFrame()
-            raw_rows = []
+            score_rows = []
 
-        if not report_df_db.empty:
-            if "월평균 검색수(추정)" in report_df_db.columns:
-                report_df_db = report_df_db.sort_values(by="월평균 검색수(추정)", ascending=False)
-            st.subheader("템플릿 8열 형식")
-            st.dataframe(report_df_db, use_container_width=True, hide_index=True)
+        if score_rows:
+            score_df = pd.DataFrame(score_rows)
+            show_cols = [
+                "started_at",
+                "seed_keyword",
+                "keyword_text",
+                "monthly_search_volume_est",
+                "product_count",
+                "demand_score",
+                "trend_score",
+                "conversion_score",
+                "competition_score",
+                "market_score",
+                "top10_avg_reviews",
+                "top10_avg_price",
+            ]
+            view_df = score_df[show_cols].rename(
+                columns={
+                    "started_at": "분석시각",
+                    "seed_keyword": "주제어",
+                    "keyword_text": "키워드",
+                    "monthly_search_volume_est": "월검색량(수요)",
+                    "product_count": "상품수(경쟁)",
+                    "demand_score": "수요 점수",
+                    "trend_score": "트렌드 점수",
+                    "conversion_score": "전환 점수",
+                    "competition_score": "경쟁 점수",
+                    "market_score": "최종 점수",
+                    "top10_avg_reviews": "쿠팡 Top10 평균리뷰수",
+                    "top10_avg_price": "쿠팡 Top10 평균가격",
+                }
+            )
+            st.dataframe(view_df, use_container_width=True, hide_index=True)
+
+            st.caption(
+                "전환 점수는 쿠팡 Top10 평균리뷰수/평균가격이 있으면 해당 값을 우선 사용하고, "
+                "수집 실패 시 클릭/CTR 대체값으로 계산됩니다."
+            )
+
             ts = datetime.now().strftime("%Y%m%d_%H%M")
-            suffix = f"TOP{top_n}_" if top10_mode else ""
-            xlsx_db = report_to_excel_bytes(report_df_db)
+            xlsx_db = report_to_excel_bytes(view_df)
             st.download_button(
-                label="엑셀 다운로드 (DB 조회 결과)",
+                label="엑셀 다운로드 (시장성 점수 조회 결과)",
                 data=xlsx_db,
-                file_name=f"모디바_카테고리별_{suffix}추천분석서_{ts}.xlsx",
+                file_name=f"모디바_시장성점수_조회결과_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_db_report",
+                key="dl_market_score_report",
                 use_container_width=True,
             )
-        elif not raw_rows:
+        else:
             st.info("조회 결과가 없습니다.")
 
 

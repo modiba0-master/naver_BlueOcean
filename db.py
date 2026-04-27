@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import math
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -148,13 +149,15 @@ def insert_keyword_metrics(
                     """
                     INSERT INTO keyword_metrics
                     (run_id, seed_keyword, keyword_text, monthly_search_volume_est, monthly_click_est,
-                     avg_ctr_pct, product_count, blue_ocean_score, strategy_text)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     avg_ctr_pct, product_count, top10_avg_reviews, top10_avg_price, blue_ocean_score, strategy_text)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                       monthly_search_volume_est=VALUES(monthly_search_volume_est),
                       monthly_click_est=VALUES(monthly_click_est),
                       avg_ctr_pct=VALUES(avg_ctr_pct),
                       product_count=VALUES(product_count),
+                      top10_avg_reviews=VALUES(top10_avg_reviews),
+                      top10_avg_price=VALUES(top10_avg_price),
                       blue_ocean_score=VALUES(blue_ocean_score),
                       strategy_text=VALUES(strategy_text)
                     """,
@@ -166,6 +169,8 @@ def insert_keyword_metrics(
                         float(r.get("monthly_click_est", 0.0) or 0.0),
                         float(r.get("avg_ctr_pct", 0.0) or 0.0),
                         int(r.get("product_count", 0) or 0),
+                        (float(r.get("top10_avg_reviews")) if r.get("top10_avg_reviews") is not None else None),
+                        (float(r.get("top10_avg_price")) if r.get("top10_avg_price") is not None else None),
                         float(r.get("blue_ocean_score", 0.0) or 0.0),
                         (str(r.get("strategy_text", ""))[:512] if r.get("strategy_text") else None),
                     ),
@@ -301,7 +306,8 @@ def query_report_metrics_full(
                 SELECT ar.started_at,
                        km.seed_keyword, km.keyword_text,
                        km.monthly_search_volume_est, km.monthly_click_est, km.avg_ctr_pct,
-                       km.product_count, km.blue_ocean_score, km.strategy_text
+                       km.product_count, km.top10_avg_reviews, km.top10_avg_price,
+                       km.blue_ocean_score, km.strategy_text
                 FROM keyword_metrics km
                 JOIN analysis_runs ar ON ar.id = km.run_id
                 {where_sql}
@@ -323,8 +329,10 @@ def query_report_metrics_full(
                 "monthly_click_est": float(r[4]),
                 "avg_ctr_pct": float(r[5]),
                 "product_count": int(r[6]),
-                "blue_ocean_score": float(r[7]),
-                "strategy_text": r[8] or "",
+                "top10_avg_reviews": (float(r[7]) if r[7] is not None else None),
+                "top10_avg_price": (float(r[8]) if r[8] is not None else None),
+                "blue_ocean_score": float(r[9]),
+                "strategy_text": r[10] or "",
             }
         )
     return out
@@ -361,12 +369,13 @@ def query_report_top_per_seed(
                 f"""
                 SELECT started_at, seed_keyword, keyword_text,
                        monthly_search_volume_est, monthly_click_est, avg_ctr_pct,
-                       product_count, blue_ocean_score, strategy_text
+                       product_count, top10_avg_reviews, top10_avg_price, blue_ocean_score, strategy_text
                 FROM (
                     SELECT ar.started_at,
                            km.seed_keyword, km.keyword_text,
                            km.monthly_search_volume_est, km.monthly_click_est, km.avg_ctr_pct,
-                           km.product_count, km.blue_ocean_score, km.strategy_text,
+                           km.product_count, km.top10_avg_reviews, km.top10_avg_price,
+                           km.blue_ocean_score, km.strategy_text,
                            ROW_NUMBER() OVER (
                              PARTITION BY km.seed_keyword
                              ORDER BY km.blue_ocean_score DESC, ar.started_at DESC
@@ -393,8 +402,10 @@ def query_report_top_per_seed(
                 "monthly_click_est": float(r[4]),
                 "avg_ctr_pct": float(r[5]),
                 "product_count": int(r[6]),
-                "blue_ocean_score": float(r[7]),
-                "strategy_text": r[8] or "",
+                "top10_avg_reviews": (float(r[7]) if r[7] is not None else None),
+                "top10_avg_price": (float(r[8]) if r[8] is not None else None),
+                "blue_ocean_score": float(r[9]),
+                "strategy_text": r[10] or "",
             }
         )
     return out
@@ -419,7 +430,8 @@ def query_recent_keyword_cache(
             cur.execute(
                 """
                 SELECT km.id, km.monthly_search_volume_est, km.monthly_click_est, km.avg_ctr_pct,
-                       km.product_count, km.blue_ocean_score, km.strategy_text
+                       km.product_count, km.top10_avg_reviews, km.top10_avg_price,
+                       km.blue_ocean_score, km.strategy_text
                 FROM keyword_metrics km
                 JOIN analysis_runs ar ON ar.id = km.run_id
                 WHERE km.keyword_text = %s
@@ -461,7 +473,124 @@ def query_recent_keyword_cache(
         "monthly_click_est": float(row[2]),
         "avg_ctr_pct": float(row[3]),
         "product_count": int(row[4]),
-        "blue_ocean_score": float(row[5]),
-        "strategy_text": row[6] or "",
+        "top10_avg_reviews": (float(row[5]) if row[5] is not None else None),
+        "top10_avg_price": (float(row[6]) if row[6] is not None else None),
+        "blue_ocean_score": float(row[7]),
+        "strategy_text": row[8] or "",
         "trends": trends,
     }
+
+
+def query_market_score_rows(
+    limit: int = 50,
+    keyword_like: Optional[str] = None,
+    started_from: Optional[datetime] = None,
+    started_to: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """
+    대시보드용 시장성 점수 조회 행.
+    점수식: 수요 * 트렌드 * 전환 / 경쟁
+    """
+    where_parts: List[str] = []
+    params: List[Any] = []
+    if keyword_like:
+        where_parts.append("km.keyword_text LIKE %s")
+        params.append(f"%{keyword_like.strip()}%")
+    if started_from:
+        where_parts.append("ar.started_at >= %s")
+        params.append(started_from)
+    if started_to:
+        where_parts.append("ar.started_at <= %s")
+        params.append(started_to)
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    lim = max(1, min(int(limit), 500))
+    params.append(lim)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT km.id, ar.started_at, km.seed_keyword, km.keyword_text,
+                       km.monthly_search_volume_est, km.monthly_click_est, km.avg_ctr_pct,
+                       km.product_count, km.top10_avg_reviews, km.top10_avg_price, km.blue_ocean_score
+                FROM keyword_metrics km
+                JOIN analysis_runs ar ON ar.id = km.run_id
+                {where_sql}
+                ORDER BY km.monthly_search_volume_est DESC, ar.started_at DESC
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+            metric_rows = cur.fetchall()
+
+            metric_ids = [int(r[0]) for r in metric_rows]
+            trend_map: Dict[int, List[float]] = {mid: [] for mid in metric_ids}
+            if metric_ids:
+                placeholders = ", ".join(["%s"] * len(metric_ids))
+                cur.execute(
+                    f"""
+                    SELECT metric_id, trend_month, est_search_volume
+                    FROM keyword_trends_monthly
+                    WHERE metric_id IN ({placeholders})
+                    ORDER BY metric_id, trend_month
+                    """,
+                    tuple(metric_ids),
+                )
+                for tr in cur.fetchall():
+                    trend_map[int(tr[0])].append(float(tr[2] or 0.0))
+
+    def _trend_score(vols: List[float]) -> float:
+        if len(vols) < 4:
+            return 1.0
+        recent = vols[-3:]
+        prev = vols[:-3] if len(vols) > 3 else vols[:1]
+        recent_avg = sum(recent) / max(1, len(recent))
+        prev_avg = sum(prev) / max(1, len(prev))
+        if prev_avg <= 0:
+            ratio = 1.2 if recent_avg > 0 else 1.0
+        else:
+            ratio = recent_avg / prev_avg
+        return max(0.7, min(1.8, float(ratio)))
+
+    out: List[Dict[str, Any]] = []
+    for r in metric_rows:
+        metric_id = int(r[0])
+        monthly_search = int(r[4] or 0)
+        monthly_click = float(r[5] or 0.0)
+        avg_ctr = float(r[6] or 0.0)
+        product_count = int(r[7] or 0)
+        top10_avg_reviews = float(r[8]) if r[8] is not None else None
+        top10_avg_price = float(r[9]) if r[9] is not None else None
+        trend_vols = trend_map.get(metric_id, [])
+
+        demand_score = math.log1p(max(0, monthly_search))
+        trend_score = _trend_score(trend_vols)
+        if top10_avg_reviews is not None and top10_avg_price is not None and top10_avg_price > 0:
+            conversion_score = max(0.1, math.log1p(max(0.0, top10_avg_reviews)) / math.log1p(top10_avg_price))
+        else:
+            conversion_score = max(0.1, math.log1p(max(0.0, monthly_click)) * (1.0 + max(0.0, avg_ctr) / 100.0))
+        competition_score = max(1.0, math.log1p(max(0, product_count)))
+        market_score = (demand_score * trend_score * conversion_score) / competition_score
+
+        out.append(
+            {
+                "started_at": r[1],
+                "seed_keyword": r[2],
+                "keyword_text": r[3],
+                "monthly_search_volume_est": monthly_search,
+                "monthly_click_est": monthly_click,
+                "avg_ctr_pct": avg_ctr,
+                "product_count": product_count,
+                "blue_ocean_score": float(r[10] or 0.0),
+                "demand_score": round(demand_score, 4),
+                "trend_score": round(trend_score, 4),
+                "conversion_score": round(conversion_score, 4),
+                "competition_score": round(competition_score, 4),
+                "market_score": round(float(market_score), 4),
+                "top10_avg_reviews": top10_avg_reviews,
+                "top10_avg_price": top10_avg_price,
+            }
+        )
+
+    out.sort(key=lambda x: x["market_score"], reverse=True)
+    return out

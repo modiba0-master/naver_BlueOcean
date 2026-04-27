@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS keyword_metrics (
   monthly_click_est DECIMAL(12,1) NOT NULL DEFAULT 0.0,
   avg_ctr_pct DECIMAL(7,2) NOT NULL DEFAULT 0.00,
   product_count INT UNSIGNED NOT NULL DEFAULT 0,
+  top10_avg_reviews DECIMAL(12,2) NULL,
+  top10_avg_price DECIMAL(12,2) NULL,
   blue_ocean_score DECIMAL(12,4) NOT NULL DEFAULT 0.0000,
   strategy_text VARCHAR(512) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -39,6 +41,10 @@ CREATE TABLE IF NOT EXISTS keyword_metrics (
     FOREIGN KEY (run_id) REFERENCES analysis_runs(id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+ALTER TABLE keyword_metrics
+  ADD COLUMN IF NOT EXISTS top10_avg_reviews DECIMAL(12,2) NULL AFTER product_count,
+  ADD COLUMN IF NOT EXISTS top10_avg_price DECIMAL(12,2) NULL AFTER top10_avg_reviews;
 
 
 CREATE TABLE IF NOT EXISTS keyword_trends_monthly (

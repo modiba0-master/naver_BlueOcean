@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -196,6 +197,57 @@ class BlueOceanTool:
         total, _ = self.get_product_info(keyword)
         return total
 
+    def get_coupang_top10_stats(self, keyword: str) -> tuple[Optional[float], Optional[float]]:
+        """
+        쿠팡 검색 결과 페이지에서 상위 10개 상품의 평균 리뷰수/평균 가격을 추정한다.
+        수집 실패 시 (None, None) 반환.
+        """
+        q = str(keyword or "").strip()
+        if not q:
+            return None, None
+
+        url = f"https://www.coupang.com/np/search?component=&q={requests.utils.quote(q)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code != 200:
+                return None, None
+            html = res.text
+
+            # 검색 결과의 JSON 블록에서 price/reviewCount를 파싱한다.
+            price_vals: List[float] = []
+            review_vals: List[float] = []
+
+            price_matches = re.findall(r'"salePrice"\s*:\s*([0-9]+)', html)
+            review_matches = re.findall(r'"ratingCount"\s*:\s*([0-9]+)', html)
+
+            for p in price_matches[:10]:
+                try:
+                    pv = float(p)
+                    if pv > 0:
+                        price_vals.append(pv)
+                except Exception:
+                    continue
+
+            for rv in review_matches[:10]:
+                try:
+                    review_vals.append(float(rv))
+                except Exception:
+                    continue
+
+            if not price_vals:
+                return None, None
+
+            avg_price = round(sum(price_vals) / len(price_vals), 2)
+            avg_reviews = round(sum(review_vals) / len(review_vals), 2) if review_vals else 0.0
+            return avg_reviews, avg_price
+        except Exception:
+            return None, None
+
     def _strategy_text(self, blue_ocean_score: float) -> str:
         if blue_ocean_score >= 70:
             return "강력 추천 황금 키워드! 수요 대비 경쟁자가 매우 적습니다."
@@ -250,6 +302,16 @@ class BlueOceanTool:
                         "monthly_click_est": float(r.get("월평균 클릭수(추정)", 0.0) or 0.0),
                         "avg_ctr_pct": float(ctr_str or 0.0),
                         "product_count": int(r.get("상품수", 0) or 0),
+                        "top10_avg_reviews": (
+                            float(r.get("쿠팡 Top10 평균리뷰수"))
+                            if r.get("쿠팡 Top10 평균리뷰수") is not None
+                            else None
+                        ),
+                        "top10_avg_price": (
+                            float(r.get("쿠팡 Top10 평균가격"))
+                            if r.get("쿠팡 Top10 평균가격") is not None
+                            else None
+                        ),
                         "blue_ocean_score": float(r.get("블루오션 점수", 0.0) or 0.0),
                         "strategy_text": self._strategy_text(float(r.get("블루오션 점수", 0.0) or 0.0)),
                     }
@@ -338,6 +400,7 @@ class BlueOceanTool:
         parsed_start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
         parsed_end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
         product_info_cache: Dict[str, tuple[int, str]] = {}
+        coupang_stats_cache: Dict[str, tuple[Optional[float], Optional[float]]] = {}
         trends_cache: Dict[str, Dict[str, float]] = {}
 
         def clean_val(v):
@@ -366,6 +429,14 @@ class BlueOceanTool:
             tr = self.get_monthly_trends(keyword, start_date, end_date)
             trends_cache[cache_key] = tr
             return tr
+
+        def cached_coupang_stats(keyword: str) -> tuple[Optional[float], Optional[float]]:
+            key = normalize_keyword(keyword)
+            if key in coupang_stats_cache:
+                return coupang_stats_cache[key]
+            stats = self.get_coupang_top10_stats(keyword)
+            coupang_stats_cache[key] = stats
+            return stats
 
         for seed in seeds:
             seed = str(seed).strip()
@@ -446,6 +517,8 @@ class BlueOceanTool:
                     demand = math.log1p(max(0.0, avg_qc)) * (1.0 + max(0.0, avg_ctr) / 100.0)
                     raw_score = (demand / max(1.0, competition)) * 100.0
                     kw_trends = cache_hit.get("trends", {}) or {}
+                    top10_avg_reviews = cache_hit.get("top10_avg_reviews")
+                    top10_avg_price = cache_hit.get("top10_avg_price")
                     if kw_trends:
                         trends_by_keyword[kw] = kw_trends
                 else:
@@ -500,6 +573,8 @@ class BlueOceanTool:
                         demand = math.log1p(max(0.0, avg_qc)) * (1.0 + max(0.0, avg_ctr) / 100.0)
                         raw_score = (demand / max(1.0, competition)) * 100.0
 
+                    top10_avg_reviews, top10_avg_price = cached_coupang_stats(kw)
+
                 all_results.append({
                     "주제어": seed,
                     "키워드": kw,
@@ -507,6 +582,8 @@ class BlueOceanTool:
                     "월평균 클릭수(추정)": round(avg_clk, 1),
                     "평균 클릭율(CTR)": f"{round(avg_ctr, 2)}%",
                     "상품수": prod_count,
+                    "쿠팡 Top10 평균리뷰수": top10_avg_reviews,
+                    "쿠팡 Top10 평균가격": top10_avg_price,
                     "_raw_score": float(raw_score),
                     "블루오션 점수": 0.0,
                 })
