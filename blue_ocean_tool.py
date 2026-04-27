@@ -409,12 +409,9 @@ class BlueOceanTool:
                 safe_total = prod_count if prod_count > 0 else 1
                 blue_ocean_score = (total_clk / safe_total) * 10000
 
-                # 상위 유망 후보군만 상세 기간 분석 진행 (API 할당량 절약)
-                if blue_ocean_score > 0.5:
-                    trends = cached_monthly_trends(kw)
-                    if not trends:
-                        continue
-
+                # 블루오션 점수 기준 컷 없이 트렌드 조회 시도
+                trends = cached_monthly_trends(kw)
+                if trends:
                     # 5개월 역산 로직 적용
                     recent_ratio = list(trends.values())[-1] if list(trends.values())[-1] > 0 else 1.0
                     scale_vector = total_qc / recent_ratio
@@ -430,15 +427,6 @@ class BlueOceanTool:
                     # 기간 평균 기준 최종 점수 재산출
                     final_score = (avg_clk / safe_total) * 10000
 
-                    all_results.append({
-                        "주제어": seed,
-                        "키워드": kw,
-                        "월평균 검색수(추정)": round(avg_qc),
-                        "월평균 클릭수(추정)": round(avg_clk, 1),
-                        "평균 클릭율(CTR)": f"{round(avg_ctr, 2)}%",
-                        "상품수": prod_count,
-                        "블루오션 점수": round(final_score, 4)
-                    })
                     trends_by_keyword[kw] = {
                         m: {
                             "ratio": float(ratio),
@@ -447,6 +435,22 @@ class BlueOceanTool:
                         }
                         for m, ratio in trends.items()
                     }
+                else:
+                    # 트렌드가 비어도 현재 월 지표 기준으로 결과를 노출
+                    avg_qc = total_qc
+                    avg_clk = total_clk
+                    avg_ctr = (total_clk / total_qc * 100) if total_qc > 0 else 0
+                    final_score = blue_ocean_score
+
+                all_results.append({
+                    "주제어": seed,
+                    "키워드": kw,
+                    "월평균 검색수(추정)": round(avg_qc),
+                    "월평균 클릭수(추정)": round(avg_clk, 1),
+                    "평균 클릭율(CTR)": f"{round(avg_ctr, 2)}%",
+                    "상품수": prod_count,
+                    "블루오션 점수": round(final_score, 4)
+                })
 
                 if idx % 50 == 0:
                     log(f"   - {idx}/{len(deduped_candidates)} 진행 중...")
