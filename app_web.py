@@ -82,7 +82,36 @@ def detect_naver_categories(seed_keyword: str, client_id: str, client_secret: st
 def run() -> None:
     st.set_page_config(page_title="Modiba BlueOcean", layout="wide")
     st.title("Modiba BlueOcean Web")
-    st.caption("Railway 웹서비스용 - 분석 실행 및 DB 결과 조회 (엑셀 템플릿 8열 형식)")
+    st.caption("Railway 웹서비스용 - 관리자 인증 후 대시보드 접근")
+
+    # 관리자 인증 게이트
+    if "is_admin_authed" not in st.session_state:
+        st.session_state["is_admin_authed"] = False
+
+    admin_id = str(os.getenv("MODIBA_ADMIN_ID", "")).strip()
+    admin_pw = str(os.getenv("MODIBA_ADMIN_PASSWORD", "")).strip()
+
+    if not admin_id or not admin_pw:
+        st.error(
+            "관리자 계정이 설정되지 않았습니다. "
+            "환경변수 `MODIBA_ADMIN_ID`, `MODIBA_ADMIN_PASSWORD`를 설정해주세요."
+        )
+        return
+
+    if not st.session_state["is_admin_authed"]:
+        with st.form("admin_login_form", clear_on_submit=False):
+            input_id = st.text_input("관리자 아이디", value="")
+            input_pw = st.text_input("관리자 비밀번호", value="", type="password")
+            submitted = st.form_submit_button("관리자 로그인", type="primary")
+            if submitted:
+                if input_id == admin_id and input_pw == admin_pw:
+                    st.session_state["is_admin_authed"] = True
+                    st.success("인증 성공. 대시보드로 이동합니다.")
+                    st.rerun()
+                else:
+                    st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
+        st.info("관리자 계정으로 로그인해야 대시보드 접근이 가능합니다.")
+        return
 
     if "seed_input" not in st.session_state:
         st.session_state["seed_input"] = ""
@@ -93,6 +122,9 @@ def run() -> None:
 
     with st.sidebar:
         st.subheader("실행 설정")
+        if st.button("로그아웃", use_container_width=True):
+            st.session_state["is_admin_authed"] = False
+            st.rerun()
         seeds_text = st.text_input("주제어(쉼표로 구분)", key="seed_input")
         detect_clicked = st.button("주제어 기반 카테고리 찾기", use_container_width=True)
         if detect_clicked:
