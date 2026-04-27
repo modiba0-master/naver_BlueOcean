@@ -14,6 +14,7 @@ import hmac
 import hashlib
 import base64
 import json
+import math
 from typing import Dict, List, Optional, Tuple
 
 from report_format import finalize_analysis_dataframe
@@ -202,6 +203,29 @@ class BlueOceanTool:
             return "유망 키워드. 썸네일과 상세페이지 차별화 추천."
         return "경쟁이 있으나 틈새 시장 공략이 가능합니다."
 
+    def _compute_growth_factor(self, est_vols_qc: List[float]) -> float:
+        """
+        검색량 추세 상승 가중치.
+        - 최근 3개월 평균 / 이전 3개월 평균 비율을 사용
+        - 과도한 튐을 막기 위해 0.7~1.8 범위로 클램프
+        """
+        if not est_vols_qc:
+            return 1.0
+        if len(est_vols_qc) < 4:
+            return 1.0
+
+        recent = est_vols_qc[-3:]
+        prev = est_vols_qc[:-3] if len(est_vols_qc) > 3 else est_vols_qc[:1]
+        recent_avg = sum(recent) / max(1, len(recent))
+        prev_avg = sum(prev) / max(1, len(prev))
+
+        if prev_avg <= 0:
+            growth = 1.2 if recent_avg > 0 else 1.0
+        else:
+            growth = recent_avg / prev_avg
+
+        return max(0.7, min(1.8, float(growth)))
+
     def _persist_to_db(self, all_results: List[Dict], trends_by_keyword: Dict[str, Dict], seeds, start_date, end_date, log) -> int:
         if not self.db_enabled:
             return 0
@@ -368,7 +392,7 @@ class BlueOceanTool:
             candidate_keywords = ranked_candidates[:deep_limit]
             mode_label = "빠른 모드" if is_fast_mode else "정밀 모드"
             log(
-                f"ㄴ {mode_label}: {len(raw_keywords)}개 중 상위 {len(candidate_keywords)}개 정밀 분석"
+                f"ㄴ {mode_label}: {len(raw_keywords)}개 중 상위 {len(candidate_keywords)}개 정밀 분석 (저경쟁/상승추세 우선)"
             )
 
             # 동일 의미 키워드 중복 제거(공백/대소문자 차이 제거)
@@ -418,8 +442,9 @@ class BlueOceanTool:
                     avg_clk = float(cache_hit.get("monthly_click_est", 0.0))
                     avg_ctr = float(cache_hit.get("avg_ctr_pct", 0.0))
                     prod_count = int(cache_hit.get("product_count", 0))
-                    safe_total = prod_count if prod_count > 0 else 1
-                    raw_score = (avg_clk / safe_total) * 10000
+                    competition = math.log1p(max(0, prod_count))
+                    demand = math.log1p(max(0.0, avg_qc)) * (1.0 + max(0.0, avg_ctr) / 100.0)
+                    raw_score = (demand / max(1.0, competition)) * 100.0
                     kw_trends = cache_hit.get("trends", {}) or {}
                     if kw_trends:
                         trends_by_keyword[kw] = kw_trends
@@ -452,8 +477,11 @@ class BlueOceanTool:
                         avg_clk = sum(est_vols_clk) / len(trends)
                         avg_ctr = (sum(est_vols_clk) / sum(est_vols_qc) * 100) if sum(est_vols_qc) > 0 else 0
 
-                        # 기간 평균 기준 원점수 재산출(추후 100점 만점 환산)
-                        raw_score = (avg_clk / safe_total) * 10000
+                        # 블루오션 핵심: 저경쟁(상품수) + 수요수준(검색/CTR) + 상승추세
+                        growth_factor = self._compute_growth_factor(est_vols_qc)
+                        competition = math.log1p(max(0, prod_count))
+                        demand = math.log1p(max(0.0, avg_qc)) * (1.0 + max(0.0, avg_ctr) / 100.0)
+                        raw_score = (demand * growth_factor / max(1.0, competition)) * 100.0
 
                         trends_by_keyword[kw] = {
                             m: {
@@ -468,7 +496,9 @@ class BlueOceanTool:
                         avg_qc = total_qc
                         avg_clk = total_clk
                         avg_ctr = (total_clk / total_qc * 100) if total_qc > 0 else 0
-                        raw_score = blue_ocean_score
+                        competition = math.log1p(max(0, prod_count))
+                        demand = math.log1p(max(0.0, avg_qc)) * (1.0 + max(0.0, avg_ctr) / 100.0)
+                        raw_score = (demand / max(1.0, competition)) * 100.0
 
                 all_results.append({
                     "주제어": seed,
