@@ -30,6 +30,7 @@ try:
         finish_run,
         insert_keyword_metrics,
         insert_monthly_trends,
+        query_recent_keyword_cache,
         query_top_keywords,
     )
 except Exception:
@@ -38,6 +39,7 @@ except Exception:
     finish_run = None
     insert_keyword_metrics = None
     insert_monthly_trends = None
+    query_recent_keyword_cache = None
     query_top_keywords = None
 
 def resource_path(relative_path: str) -> str:
@@ -306,6 +308,11 @@ class BlueOceanTool:
         trends_by_keyword: Dict[str, Dict[str, Dict[str, float]]] = {}
         mode = str(analysis_mode or "precise").strip().lower()
         is_fast_mode = mode in {"fast", "quick", "빠른", "빠른모드"}
+        deep_limit = 20 if is_fast_mode else 60
+        trend_limit = 20
+        cache_ttl_hours = 24
+        parsed_start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+        parsed_end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
         product_info_cache: Dict[str, tuple[int, str]] = {}
         trends_cache: Dict[str, Dict[str, float]] = {}
 
@@ -349,19 +356,20 @@ class BlueOceanTool:
 
             candidate_keywords = raw_keywords
             discovered_category_counter: Counter[str] = Counter()
-            if is_fast_mode:
-                ranked_candidates = sorted(
-                    raw_keywords,
-                    key=lambda x: clean_val(x.get("monthlyMobileQcCnt")),
-                    reverse=True,
-                )
-                # 빠른 모드 강한 조기탈락: 상위 120개만 후보로 제한
-                candidate_keywords = ranked_candidates[:120]
-                log(
-                    f"ㄴ 빠른 모드: {len(raw_keywords)}개 중 상위 {len(candidate_keywords)}개 후보 우선 분석"
-                )
-            else:
-                log(f"ㄴ {len(raw_keywords)}개 연관 키워드 전수 분석 시작... (약 1~2분 소요)")
+            # 1차 선별: 모바일 클릭수 70% + 모바일 검색수 30%
+            ranked_candidates = sorted(
+                raw_keywords,
+                key=lambda x: (
+                    clean_val(x.get("monthlyAveMobileClkCnt")) * 0.7
+                    + clean_val(x.get("monthlyMobileQcCnt")) * 0.3
+                ),
+                reverse=True,
+            )
+            candidate_keywords = ranked_candidates[:deep_limit]
+            mode_label = "빠른 모드" if is_fast_mode else "정밀 모드"
+            log(
+                f"ㄴ {mode_label}: {len(raw_keywords)}개 중 상위 {len(candidate_keywords)}개 정밀 분석"
+            )
 
             # 동일 의미 키워드 중복 제거(공백/대소문자 차이 제거)
             deduped_candidates = []
@@ -378,6 +386,7 @@ class BlueOceanTool:
 
             for idx, item in enumerate(deduped_candidates):
                 kw = item['relKeyword']
+                use_trend_api = idx < trend_limit
 
                 mo_qc = clean_val(item.get("monthlyMobileQcCnt"))
                 total_qc = mo_qc
@@ -392,52 +401,74 @@ class BlueOceanTool:
                 if is_fast_mode and total_clk < 10:
                     continue
 
-                # 쇼핑 상품 수/카테고리 조회
-                prod_count, kw_category = cached_product_info(kw)
-                time.sleep(0.02)
+                cache_hit = None
+                if self.db_enabled and query_recent_keyword_cache is not None:
+                    try:
+                        cache_hit = query_recent_keyword_cache(
+                            kw,
+                            start_date=parsed_start_date,
+                            end_date=parsed_end_date,
+                            ttl_hours=cache_ttl_hours,
+                        )
+                    except Exception:
+                        cache_hit = None
 
-                # 주제어 기반이 아닌, 실행 중 새롭게 탐색된 카테고리를 우선 기준으로 축적
-                if kw_category:
-                    kw_top = " > ".join(kw_category.split(" > ")[:2])
-                    if kw_top:
-                        discovered_category_counter[kw_top] += 1
-
-                # 블루오션 점수 (최신 한 달 기준 1차 필터링)
-                safe_total = prod_count if prod_count > 0 else 1
-                blue_ocean_score = (total_clk / safe_total) * 10000
-
-                # 블루오션 점수 기준 컷 없이 트렌드 조회 시도
-                trends = cached_monthly_trends(kw)
-                if trends:
-                    # 5개월 역산 로직 적용
-                    recent_ratio = list(trends.values())[-1] if list(trends.values())[-1] > 0 else 1.0
-                    scale_vector = total_qc / recent_ratio
-                    scale_clk_vector = total_clk / recent_ratio
-
-                    est_vols_qc = [r * scale_vector for r in trends.values()]
-                    est_vols_clk = [r * scale_clk_vector for r in trends.values()]
-
-                    avg_qc = sum(est_vols_qc) / len(trends)
-                    avg_clk = sum(est_vols_clk) / len(trends)
-                    avg_ctr = (sum(est_vols_clk) / sum(est_vols_qc) * 100) if sum(est_vols_qc) > 0 else 0
-
-                    # 기간 평균 기준 원점수 재산출(추후 100점 만점 환산)
+                if cache_hit is not None:
+                    avg_qc = float(cache_hit.get("monthly_search_volume_est", 0))
+                    avg_clk = float(cache_hit.get("monthly_click_est", 0.0))
+                    avg_ctr = float(cache_hit.get("avg_ctr_pct", 0.0))
+                    prod_count = int(cache_hit.get("product_count", 0))
+                    safe_total = prod_count if prod_count > 0 else 1
                     raw_score = (avg_clk / safe_total) * 10000
-
-                    trends_by_keyword[kw] = {
-                        m: {
-                            "ratio": float(ratio),
-                            "est_search_volume": int(round(ratio * scale_vector)),
-                            "est_click_volume": float(round(ratio * scale_clk_vector, 1)),
-                        }
-                        for m, ratio in trends.items()
-                    }
+                    kw_trends = cache_hit.get("trends", {}) or {}
+                    if kw_trends:
+                        trends_by_keyword[kw] = kw_trends
                 else:
-                    # 트렌드가 비어도 현재 월 지표 기준으로 결과를 노출
-                    avg_qc = total_qc
-                    avg_clk = total_clk
-                    avg_ctr = (total_clk / total_qc * 100) if total_qc > 0 else 0
-                    raw_score = blue_ocean_score
+                    # 쇼핑 상품 수/카테고리 조회
+                    prod_count, kw_category = cached_product_info(kw)
+                    time.sleep(0.02)
+
+                    # 주제어 기반이 아닌, 실행 중 새롭게 탐색된 카테고리를 우선 기준으로 축적
+                    if kw_category:
+                        kw_top = " > ".join(kw_category.split(" > ")[:2])
+                        if kw_top:
+                            discovered_category_counter[kw_top] += 1
+
+                    # 블루오션 점수 (최신 한 달 기준 1차 필터링)
+                    safe_total = prod_count if prod_count > 0 else 1
+                    blue_ocean_score = (total_clk / safe_total) * 10000
+
+                    trends = cached_monthly_trends(kw) if use_trend_api else {}
+                    if trends:
+                        # 5개월 역산 로직 적용
+                        recent_ratio = list(trends.values())[-1] if list(trends.values())[-1] > 0 else 1.0
+                        scale_vector = total_qc / recent_ratio
+                        scale_clk_vector = total_clk / recent_ratio
+
+                        est_vols_qc = [r * scale_vector for r in trends.values()]
+                        est_vols_clk = [r * scale_clk_vector for r in trends.values()]
+
+                        avg_qc = sum(est_vols_qc) / len(trends)
+                        avg_clk = sum(est_vols_clk) / len(trends)
+                        avg_ctr = (sum(est_vols_clk) / sum(est_vols_qc) * 100) if sum(est_vols_qc) > 0 else 0
+
+                        # 기간 평균 기준 원점수 재산출(추후 100점 만점 환산)
+                        raw_score = (avg_clk / safe_total) * 10000
+
+                        trends_by_keyword[kw] = {
+                            m: {
+                                "ratio": float(ratio),
+                                "est_search_volume": int(round(ratio * scale_vector)),
+                                "est_click_volume": float(round(ratio * scale_clk_vector, 1)),
+                            }
+                            for m, ratio in trends.items()
+                        }
+                    else:
+                        # 트렌드 호출 생략/빈값 시 현재 월 지표로 계산
+                        avg_qc = total_qc
+                        avg_clk = total_clk
+                        avg_ctr = (total_clk / total_qc * 100) if total_qc > 0 else 0
+                        raw_score = blue_ocean_score
 
                 all_results.append({
                     "주제어": seed,

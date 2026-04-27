@@ -398,3 +398,70 @@ def query_report_top_per_seed(
             }
         )
     return out
+
+
+def query_recent_keyword_cache(
+    keyword_text: str,
+    *,
+    start_date: date,
+    end_date: date,
+    ttl_hours: int = 24,
+) -> Optional[Dict[str, Any]]:
+    """
+    최근 TTL 내 동일 키워드 지표/월별 트렌드 캐시 조회.
+    """
+    keyword = str(keyword_text or "").strip()
+    if not keyword:
+        return None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT km.id, km.monthly_search_volume_est, km.monthly_click_est, km.avg_ctr_pct,
+                       km.product_count, km.blue_ocean_score, km.strategy_text
+                FROM keyword_metrics km
+                JOIN analysis_runs ar ON ar.id = km.run_id
+                WHERE km.keyword_text = %s
+                  AND ar.status = 'SUCCESS'
+                  AND ar.start_date = %s
+                  AND ar.end_date = %s
+                  AND ar.started_at >= DATE_SUB(NOW(), INTERVAL %s HOUR)
+                ORDER BY ar.started_at DESC
+                LIMIT 1
+                """,
+                (keyword, start_date, end_date, int(max(1, ttl_hours))),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            metric_id = int(row[0])
+            cur.execute(
+                """
+                SELECT trend_month, ratio_value, est_search_volume, est_click_volume
+                FROM keyword_trends_monthly
+                WHERE metric_id = %s
+                ORDER BY trend_month
+                """,
+                (metric_id,),
+            )
+            trend_rows = cur.fetchall()
+
+    trends: Dict[str, Dict[str, Any]] = {}
+    for tr in trend_rows:
+        trends[str(tr[0])] = {
+            "ratio": float(tr[1]),
+            "est_search_volume": int(tr[2]),
+            "est_click_volume": float(tr[3]),
+        }
+
+    return {
+        "monthly_search_volume_est": int(row[1]),
+        "monthly_click_est": float(row[2]),
+        "avg_ctr_pct": float(row[3]),
+        "product_count": int(row[4]),
+        "blue_ocean_score": float(row[5]),
+        "strategy_text": row[6] or "",
+        "trends": trends,
+    }
