@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import uuid
 import math
+import json
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -100,9 +101,12 @@ def get_connection() -> Generator[pymysql.connections.Connection, None, None]:
 
 
 def ensure_schema() -> None:
-    schema_file = Path(__file__).resolve().parent / "sql" / "001_blue_ocean_mariadb.sql"
-    sql_text = schema_file.read_text(encoding="utf-8")
-    statements = [s.strip() for s in sql_text.split(";") if s.strip()]
+    sql_dir = Path(__file__).resolve().parent / "sql"
+    sql_files = sorted(sql_dir.glob("*.sql"))
+    statements: List[str] = []
+    for schema_file in sql_files:
+        sql_text = schema_file.read_text(encoding="utf-8")
+        statements.extend([s.strip() for s in sql_text.split(";") if s.strip()])
     with get_connection() as conn:
         with conn.cursor() as cur:
             for stmt in statements:
@@ -217,6 +221,99 @@ def insert_monthly_trends(metric_id: int, trend_rows: Iterable[Dict[str, Any]]) 
                   ratio_value=VALUES(ratio_value),
                   est_search_volume=VALUES(est_search_volume),
                   est_click_volume=VALUES(est_click_volume)
+                """,
+                batch,
+            )
+    return len(batch)
+
+
+def insert_keyword_evaluations(run_id: int, rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for r in rows:
+                cur.execute(
+                    """
+                    INSERT INTO keyword_evaluations
+                    (run_id, metric_id, opportunity_score, commercial_score, final_score, decision_band)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                      opportunity_score=VALUES(opportunity_score),
+                      commercial_score=VALUES(commercial_score),
+                      final_score=VALUES(final_score),
+                      decision_band=VALUES(decision_band)
+                    """,
+                    (
+                        int(run_id),
+                        int(r.get("metric_id", 0) or 0),
+                        float(r.get("opportunity_score", 0.0) or 0.0),
+                        float(r.get("commercial_score", 0.0) or 0.0),
+                        float(r.get("final_score", 0.0) or 0.0),
+                        str(r.get("decision_band", "WATCH"))[:16],
+                    ),
+                )
+                eval_id = int(cur.lastrowid) if cur.lastrowid else 0
+                out.append({"evaluation_id": eval_id, "metric_id": int(r.get("metric_id", 0) or 0)})
+    return out
+
+
+def insert_ai_insights(rows: Iterable[Dict[str, Any]]) -> int:
+    batch = []
+    for r in rows:
+        batch.append(
+            (
+                int(r.get("run_id", 0) or 0),
+                int(r.get("metric_id", 0) or 0),
+                str(r.get("keyword_text", ""))[:255],
+                str(r.get("summary_text", ""))[:2000],
+                str(r.get("action_text", ""))[:1000],
+                str(r.get("risk_text", ""))[:2000],
+                json.dumps(r.get("evidence_json", []), ensure_ascii=False),
+                float(r.get("confidence_score", 0.0) or 0.0),
+                str(r.get("model_version", "rule-based-v1"))[:64],
+                int(r.get("token_usage_est", 0) or 0),
+                1 if bool(r.get("cache_hit", False)) else 0,
+            )
+        )
+    if not batch:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO ai_insights
+                (run_id, metric_id, keyword_text, summary_text, action_text, risk_text,
+                 evidence_json, confidence_score, model_version, token_usage_est, cache_hit)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                batch,
+            )
+    return len(batch)
+
+
+def insert_ai_pipeline_logs(run_id: int, metric_id: int, rows: Iterable[Dict[str, Any]]) -> int:
+    batch = []
+    for r in rows:
+        batch.append(
+            (
+                int(run_id),
+                int(metric_id),
+                str(r.get("node_name", ""))[:64],
+                str(r.get("status", "SUCCESS"))[:16],
+                int(r.get("latency_ms", 0) or 0),
+                int(r.get("token_usage_est", 0) or 0),
+                str(r.get("meta_json", ""))[:2000] if r.get("meta_json") else None,
+            )
+        )
+    if not batch:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO ai_pipeline_logs
+                (run_id, metric_id, node_name, status, latency_ms, token_usage_est, meta_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 batch,
             )
@@ -512,9 +609,21 @@ def query_market_score_rows(
                 f"""
                 SELECT km.id, ar.started_at, km.seed_keyword, km.keyword_text,
                        km.monthly_search_volume_est, km.monthly_click_est, km.avg_ctr_pct,
-                       km.product_count, km.top10_avg_reviews, km.top10_avg_price, km.blue_ocean_score
+                       km.product_count, km.top10_avg_reviews, km.top10_avg_price, km.blue_ocean_score,
+                       ke.opportunity_score, ke.commercial_score, ke.final_score, ke.decision_band,
+                       ai.summary_text, ai.action_text, ai.risk_text, ai.confidence_score, ai.model_version
                 FROM keyword_metrics km
                 JOIN analysis_runs ar ON ar.id = km.run_id
+                LEFT JOIN keyword_evaluations ke ON ke.metric_id = km.id
+                LEFT JOIN (
+                    SELECT t1.*
+                    FROM ai_insights t1
+                    JOIN (
+                        SELECT metric_id, MAX(id) AS max_id
+                        FROM ai_insights
+                        GROUP BY metric_id
+                    ) t2 ON t1.metric_id = t2.metric_id AND t1.id = t2.max_id
+                ) ai ON ai.metric_id = km.id
                 {where_sql}
                 ORDER BY km.monthly_search_volume_est DESC, ar.started_at DESC
                 LIMIT %s
@@ -572,6 +681,16 @@ def query_market_score_rows(
         competition_score = max(1.0, math.log1p(max(0, product_count)))
         market_score = (demand_score * trend_score * conversion_score) / competition_score
 
+        opportunity_score = float(r[11]) if r[11] is not None else None
+        commercial_score = float(r[12]) if r[12] is not None else None
+        final_score = float(r[13]) if r[13] is not None else None
+        decision_band = str(r[14]) if r[14] is not None else None
+        ai_summary = str(r[15]) if r[15] is not None else None
+        ai_action = str(r[16]) if r[16] is not None else None
+        ai_risk = str(r[17]) if r[17] is not None else None
+        ai_confidence = float(r[18]) if r[18] is not None else None
+        ai_model_version = str(r[19]) if r[19] is not None else None
+
         out.append(
             {
                 "started_at": r[1],
@@ -587,8 +706,17 @@ def query_market_score_rows(
                 "conversion_score": round(conversion_score, 4),
                 "competition_score": round(competition_score, 4),
                 "market_score": round(float(market_score), 4),
+                "opportunity_score": opportunity_score,
+                "commercial_score": commercial_score,
+                "final_score": final_score,
+                "decision_band": decision_band,
                 "top10_avg_reviews": top10_avg_reviews,
                 "top10_avg_price": top10_avg_price,
+                "ai_summary": ai_summary,
+                "ai_action": ai_action,
+                "ai_risk": ai_risk,
+                "ai_confidence": ai_confidence,
+                "ai_model_version": ai_model_version,
             }
         )
 

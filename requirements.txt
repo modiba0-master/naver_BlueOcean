@@ -6,3 +6,5 @@ streamlit
 xlrd
 beautifulsoup4
 selenium
+langgraph
+chromadb

@@ -15,10 +15,11 @@ import hashlib
 import base64
 import json
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from report_format import finalize_analysis_dataframe
 from coupang_crawler import get_shared_crawler
+from ai_pipeline import AIPipeline
 
 try:
     import customtkinter as ctk
@@ -31,6 +32,9 @@ try:
         ensure_schema,
         finish_run,
         insert_keyword_metrics,
+        insert_keyword_evaluations,
+        insert_ai_insights,
+        insert_ai_pipeline_logs,
         insert_monthly_trends,
         query_recent_keyword_cache,
         query_top_keywords,
@@ -40,6 +44,9 @@ except Exception:
     ensure_schema = None
     finish_run = None
     insert_keyword_metrics = None
+    insert_keyword_evaluations = None
+    insert_ai_insights = None
+    insert_ai_pipeline_logs = None
     insert_monthly_trends = None
     query_recent_keyword_cache = None
     query_top_keywords = None
@@ -104,7 +111,14 @@ class BlueOceanTool:
         self.output_dir = self.config['settings']['output_dir']
         self.save_excel = bool(self.config.get("settings", {}).get("save_excel", False))
         self.db_enabled = bool(self.config.get("settings", {}).get("db_enabled", True))
+        self.ai_insight_enabled = str(os.getenv("AI_INSIGHT_ENABLED", "true")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self._apply_db_env_from_config()
+        self.ai_pipeline = AIPipeline(base_dir=os.path.dirname(os.path.abspath(__file__)))
         
         # 출력 폴더 생성
         if not os.path.exists(self.output_dir):
@@ -239,7 +253,90 @@ class BlueOceanTool:
 
         return max(0.7, min(1.8, float(growth)))
 
-    def _persist_to_db(self, all_results: List[Dict], trends_by_keyword: Dict[str, Dict], seeds, start_date, end_date, log) -> int:
+    def _compute_commercial_score(
+        self,
+        *,
+        monthly_click_est: float,
+        avg_ctr_pct: float,
+        top10_avg_reviews: Optional[float],
+        top10_avg_price: Optional[float],
+        product_count: int,
+    ) -> float:
+        click_part = min(100.0, math.log1p(max(0.0, monthly_click_est)) * 14.5)
+        ctr_part = min(100.0, max(0.0, avg_ctr_pct) * 6.0)
+        if top10_avg_reviews is not None and top10_avg_price is not None and top10_avg_price > 0:
+            review_price_ratio = math.log1p(max(0.0, top10_avg_reviews)) / math.log1p(max(1.0, top10_avg_price))
+            conversion_part = min(100.0, max(0.0, review_price_ratio) * 65.0)
+        else:
+            conversion_part = min(100.0, click_part * 0.55 + ctr_part * 0.45)
+        competition_penalty = min(35.0, math.log1p(max(0, product_count)) * 2.6)
+        commercial = (conversion_part * 0.65 + click_part * 0.2 + ctr_part * 0.15) - competition_penalty
+        return round(max(0.0, min(100.0, commercial)), 2)
+
+    def _decision_band(self, final_score: float) -> str:
+        if final_score >= 70:
+            return "GO"
+        if final_score >= 45:
+            return "WATCH"
+        return "DROP"
+
+    def _build_evaluation_rows(
+        self,
+        all_results: List[Dict],
+        *,
+        start_date: str,
+        end_date: str,
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for r in all_results:
+            opportunity_score = float(r.get("블루오션 점수", 0.0) or 0.0)
+            commercial_score = self._compute_commercial_score(
+                monthly_click_est=float(r.get("월평균 클릭수(추정)", 0.0) or 0.0),
+                avg_ctr_pct=float(str(r.get("평균 클릭율(CTR)", "0")).replace("%", "") or 0.0),
+                top10_avg_reviews=(
+                    float(r.get("쿠팡 Top10 평균리뷰수"))
+                    if r.get("쿠팡 Top10 평균리뷰수") is not None
+                    else None
+                ),
+                top10_avg_price=(
+                    float(r.get("쿠팡 Top10 평균가격"))
+                    if r.get("쿠팡 Top10 평균가격") is not None
+                    else None
+                ),
+                product_count=int(r.get("상품수", 0) or 0),
+            )
+            final_score = round(opportunity_score * 0.45 + commercial_score * 0.55, 2)
+            decision_band = self._decision_band(final_score)
+            rows.append(
+                {
+                    "seed_keyword": r.get("주제어", ""),
+                    "keyword_text": r.get("키워드", ""),
+                    "opportunity_score": round(opportunity_score, 2),
+                    "commercial_score": commercial_score,
+                    "final_score": final_score,
+                    "decision_band": decision_band,
+                    "date_range": f"{start_date}:{end_date}",
+                    "monthly_search_volume_est": int(r.get("월평균 검색수(추정)", 0) or 0),
+                    "monthly_click_est": float(r.get("월평균 클릭수(추정)", 0.0) or 0.0),
+                    "avg_ctr_pct": float(str(r.get("평균 클릭율(CTR)", "0")).replace("%", "") or 0.0),
+                    "product_count": int(r.get("상품수", 0) or 0),
+                    "trend_score": float(r.get("트렌드 점수", 1.0) or 1.0),
+                    "top10_avg_reviews": r.get("쿠팡 Top10 평균리뷰수"),
+                    "top10_avg_price": r.get("쿠팡 Top10 평균가격"),
+                }
+            )
+        return rows
+
+    def _persist_to_db(
+        self,
+        all_results: List[Dict],
+        trends_by_keyword: Dict[str, Dict],
+        evaluation_rows: List[Dict[str, Any]],
+        seeds,
+        start_date,
+        end_date,
+        log,
+    ) -> int:
         if not self.db_enabled:
             return 0
         if create_run is None:
@@ -298,8 +395,90 @@ class BlueOceanTool:
                     )
                 trend_inserted += insert_monthly_trends(metric_id, trend_rows)
 
+            eval_inserted = 0
+            insight_inserted = 0
+            pipeline_log_inserted = 0
+            if insert_keyword_evaluations is not None and evaluation_rows:
+                eval_payload = []
+                for e in evaluation_rows:
+                    metric_id = kw_to_metric.get(str(e.get("keyword_text", "")), 0)
+                    if not metric_id:
+                        continue
+                    eval_payload.append(
+                        {
+                            "metric_id": int(metric_id),
+                            "opportunity_score": float(e.get("opportunity_score", 0.0) or 0.0),
+                            "commercial_score": float(e.get("commercial_score", 0.0) or 0.0),
+                            "final_score": float(e.get("final_score", 0.0) or 0.0),
+                            "decision_band": str(e.get("decision_band", "WATCH")),
+                        }
+                    )
+                eval_refs = insert_keyword_evaluations(run_id, eval_payload)
+                eval_inserted = len(eval_refs)
+
+                if self.ai_insight_enabled and insert_ai_insights is not None and insert_ai_pipeline_logs is not None:
+                    memory_rows = []
+                    for e in evaluation_rows:
+                        payload = dict(e)
+                        payload["run_id"] = run_id
+                        insight = self.ai_pipeline.generate_insight(payload)
+                        metric_id = kw_to_metric.get(str(e.get("keyword_text", "")), 0)
+                        if not metric_id:
+                            continue
+                        insert_ai_insights(
+                            [
+                                {
+                                    "run_id": run_id,
+                                    "metric_id": int(metric_id),
+                                    "keyword_text": str(e.get("keyword_text", "")),
+                                    "summary_text": str(insight.get("summary", "")),
+                                    "action_text": str(insight.get("action", "")),
+                                    "risk_text": "\n".join(insight.get("risks", []) or []),
+                                    "evidence_json": insight.get("evidence", []),
+                                    "confidence_score": float(insight.get("confidence", 0.0) or 0.0),
+                                    "model_version": str(insight.get("model_version", "rule-based-v1")),
+                                    "token_usage_est": int(insight.get("token_usage_est", 0) or 0),
+                                    "cache_hit": bool(insight.get("cache_hit", False)),
+                                }
+                            ]
+                        )
+                        insight_inserted += 1
+                        pipeline_logs = insight.get("pipeline_logs", []) or []
+                        if pipeline_logs:
+                            insert_ai_pipeline_logs(
+                                run_id,
+                                int(metric_id),
+                                [
+                                    {
+                                        "node_name": str(l.get("node_name", "node")),
+                                        "status": str(l.get("status", "SUCCESS")),
+                                        "latency_ms": int(l.get("latency_ms", 0) or 0),
+                                        "token_usage_est": int(l.get("token_usage_est", 0) or 0),
+                                        "meta_json": l.get("meta_json"),
+                                    }
+                                    for l in pipeline_logs
+                                ],
+                            )
+                            pipeline_log_inserted += len(pipeline_logs)
+                        memory_rows.append(
+                            {
+                                "run_id": run_id,
+                                "seed_keyword": e.get("seed_keyword", ""),
+                                "keyword_text": e.get("keyword_text", ""),
+                                "opportunity_score": e.get("opportunity_score", 0.0),
+                                "commercial_score": e.get("commercial_score", 0.0),
+                                "final_score": e.get("final_score", 0.0),
+                                "decision_band": e.get("decision_band", "WATCH"),
+                            }
+                        )
+                    self.ai_pipeline.upsert_case_memory(memory_rows)
+
             finish_run(run_id, success=True, result_count=len(metric_rows))
-            log(f"🗄️ DB 저장 완료: run_id={run_id}, metrics={len(metric_rows)}건, trends={trend_inserted}건")
+            log(
+                f"🗄️ DB 저장 완료: run_id={run_id}, metrics={len(metric_rows)}건, "
+                f"trends={trend_inserted}건, evals={eval_inserted}건, insights={insight_inserted}건, "
+                f"pipeline_logs={pipeline_log_inserted}건"
+            )
             return run_id
         except Exception as e:
             finish_run(run_id, success=False, result_count=0, error_message=str(e))
@@ -449,6 +628,10 @@ class BlueOceanTool:
                     continue
 
                 cache_hit = None
+                trend_score = 1.0
+                demand_score = 0.0
+                conversion_score = 0.0
+                competition_score = 1.0
                 if self.db_enabled and query_recent_keyword_cache is not None:
                     try:
                         cache_hit = query_recent_keyword_cache(
@@ -465,13 +648,19 @@ class BlueOceanTool:
                     avg_clk = float(cache_hit.get("monthly_click_est", 0.0))
                     avg_ctr = float(cache_hit.get("avg_ctr_pct", 0.0))
                     prod_count = int(cache_hit.get("product_count", 0))
-                    competition = math.log1p(max(0, prod_count))
-                    demand = math.log1p(max(0.0, avg_qc)) * (1.0 + max(0.0, avg_ctr) / 100.0)
-                    raw_score = (demand / max(1.0, competition)) * 100.0
+                    competition_score = max(1.0, math.log1p(max(0, prod_count)))
+                    demand_score = math.log1p(max(0.0, avg_qc))
+                    conversion_score = max(0.1, math.log1p(max(0.0, avg_clk)) * (1.0 + max(0.0, avg_ctr) / 100.0))
+                    raw_score = (demand_score * conversion_score / competition_score) * 100.0
                     kw_trends = cache_hit.get("trends", {}) or {}
                     top10_avg_reviews = cache_hit.get("top10_avg_reviews")
                     top10_avg_price = cache_hit.get("top10_avg_price")
                     if kw_trends:
+                        trend_vols = [
+                            float(v.get("est_search_volume", 0.0) or 0.0)
+                            for _, v in sorted(kw_trends.items(), key=lambda x: x[0])
+                        ]
+                        trend_score = self._compute_growth_factor(trend_vols) if trend_vols else 1.0
                         trends_by_keyword[kw] = kw_trends
                 else:
                     # 쇼핑 상품 수/카테고리 조회
@@ -503,10 +692,13 @@ class BlueOceanTool:
                         avg_ctr = (sum(est_vols_clk) / sum(est_vols_qc) * 100) if sum(est_vols_qc) > 0 else 0
 
                         # 블루오션 핵심: 저경쟁(상품수) + 수요수준(검색/CTR) + 상승추세
-                        growth_factor = self._compute_growth_factor(est_vols_qc)
-                        competition = math.log1p(max(0, prod_count))
-                        demand = math.log1p(max(0.0, avg_qc)) * (1.0 + max(0.0, avg_ctr) / 100.0)
-                        raw_score = (demand * growth_factor / max(1.0, competition)) * 100.0
+                        trend_score = self._compute_growth_factor(est_vols_qc)
+                        competition_score = max(1.0, math.log1p(max(0, prod_count)))
+                        demand_score = math.log1p(max(0.0, avg_qc))
+                        conversion_score = max(
+                            0.1, math.log1p(max(0.0, avg_clk)) * (1.0 + max(0.0, avg_ctr) / 100.0)
+                        )
+                        raw_score = (demand_score * trend_score * conversion_score / competition_score) * 100.0
 
                         trends_by_keyword[kw] = {
                             m: {
@@ -521,11 +713,18 @@ class BlueOceanTool:
                         avg_qc = total_qc
                         avg_clk = total_clk
                         avg_ctr = (total_clk / total_qc * 100) if total_qc > 0 else 0
-                        competition = math.log1p(max(0, prod_count))
-                        demand = math.log1p(max(0.0, avg_qc)) * (1.0 + max(0.0, avg_ctr) / 100.0)
-                        raw_score = (demand / max(1.0, competition)) * 100.0
+                        competition_score = max(1.0, math.log1p(max(0, prod_count)))
+                        demand_score = math.log1p(max(0.0, avg_qc))
+                        conversion_score = max(
+                            0.1, math.log1p(max(0.0, avg_clk)) * (1.0 + max(0.0, avg_ctr) / 100.0)
+                        )
+                        raw_score = (demand_score * conversion_score / competition_score) * 100.0
 
                     top10_avg_reviews, top10_avg_price = self.get_coupang_top10_stats(kw)
+                    if top10_avg_reviews is not None and top10_avg_price is not None and top10_avg_price > 0:
+                        conversion_score = max(
+                            0.1, math.log1p(max(0.0, top10_avg_reviews)) / math.log1p(max(1.0, top10_avg_price))
+                        )
 
                 all_results.append({
                     "주제어": seed,
@@ -536,6 +735,10 @@ class BlueOceanTool:
                     "상품수": prod_count,
                     "쿠팡 Top10 평균리뷰수": top10_avg_reviews,
                     "쿠팡 Top10 평균가격": top10_avg_price,
+                    "수요 점수": round(demand_score, 4),
+                    "트렌드 점수": round(trend_score, 4),
+                    "전환 점수": round(conversion_score, 4),
+                    "경쟁 점수": round(competition_score, 4),
                     "_raw_score": float(raw_score),
                     "블루오션 점수": 0.0,
                 })
@@ -557,9 +760,24 @@ class BlueOceanTool:
                 r["블루오션 점수"] = round(norm_score, 2)
                 r.pop("_raw_score", None)
 
+            evaluation_rows = self._build_evaluation_rows(
+                all_results,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            eval_map = {str(e["keyword_text"]): e for e in evaluation_rows}
+            for r in all_results:
+                er = eval_map.get(str(r.get("키워드", "")))
+                if not er:
+                    continue
+                r["기회 점수"] = er["opportunity_score"]
+                r["판매가치 점수"] = er["commercial_score"]
+                r["최종 점수"] = er["final_score"]
+                r["판단 밴드"] = er["decision_band"]
+
             df = (
                 pd.DataFrame(all_results)
-                .sort_values(by="블루오션 점수", ascending=False)
+                .sort_values(by="최종 점수", ascending=False)
                 .head(50)
                 .sort_values(by="월평균 검색수(추정)", ascending=False)
             )  # 점수 상위 50개 선별 후 모바일 검색수 내림차순 표시
@@ -568,7 +786,15 @@ class BlueOceanTool:
             report_df = finalize_analysis_dataframe(df)
 
             # DB 저장(기본)
-            run_id = self._persist_to_db(all_results, trends_by_keyword, seeds, start_date, end_date, log)
+            run_id = self._persist_to_db(
+                all_results,
+                trends_by_keyword,
+                evaluation_rows,
+                seeds,
+                start_date,
+                end_date,
+                log,
+            )
 
             # Excel 저장(옵션)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M")

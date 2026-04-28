@@ -239,9 +239,14 @@ def run() -> None:
                 "conversion_score",
                 "competition_score",
                 "market_score",
+                "opportunity_score",
+                "commercial_score",
+                "final_score",
+                "decision_band",
                 "top10_avg_reviews",
                 "top10_avg_price",
             ]
+            show_cols = [c for c in show_cols if c in score_df.columns]
             view_df = score_df[show_cols].rename(
                 columns={
                     "started_at": "분석시각",
@@ -254,11 +259,49 @@ def run() -> None:
                     "conversion_score": "전환 점수",
                     "competition_score": "경쟁 점수",
                     "market_score": "최종 점수",
+                    "opportunity_score": "기회 점수",
+                    "commercial_score": "판매가치 점수",
+                    "final_score": "2차 최종 점수",
+                    "decision_band": "판단 밴드",
                     "top10_avg_reviews": "쿠팡 Top10 평균리뷰수",
                     "top10_avg_price": "쿠팡 Top10 평균가격",
                 }
             )
             st.dataframe(view_df, use_container_width=True, hide_index=True)
+
+            insight_cols = [
+                "keyword_text",
+                "decision_band",
+                "ai_summary",
+                "ai_action",
+                "ai_risk",
+                "ai_confidence",
+                "ai_model_version",
+            ]
+            if all(c in score_df.columns for c in insight_cols):
+                insight_rows = score_df[insight_cols].fillna("")
+                with st.expander("AI 인사이트 (근거 기반 요약)", expanded=False):
+                    for _, row in insight_rows.head(10).iterrows():
+                        keyword = str(row.get("keyword_text", "")).strip()
+                        if not keyword:
+                            continue
+                        st.markdown(f"**{keyword}** · {row.get('decision_band', '')}")
+                        summary = str(row.get("ai_summary", "")).strip()
+                        action = str(row.get("ai_action", "")).strip()
+                        risk = str(row.get("ai_risk", "")).strip()
+                        confidence = row.get("ai_confidence", "")
+                        model_version = str(row.get("ai_model_version", "")).strip()
+                        if summary:
+                            st.write(f"- 요약: {summary}")
+                        if action:
+                            st.write(f"- 액션: {action}")
+                        if risk:
+                            st.write(f"- 리스크: {risk}")
+                        if confidence != "":
+                            st.write(f"- 신뢰도: {confidence}")
+                        if model_version:
+                            st.caption(f"model: {model_version}")
+                        st.divider()
 
             st.caption(
                 "전환 점수는 쿠팡 Top10 평균리뷰수/평균가격이 있으면 해당 값을 우선 사용하고, "
