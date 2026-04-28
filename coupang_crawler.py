@@ -4,6 +4,8 @@ import os
 import random
 import re
 import time
+import os
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/root/.cache/ms-playwright"
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
@@ -253,6 +255,7 @@ class CoupangCrawler:
             self._context = self._playwright.chromium.launch_persistent_context(
                 user_data_dir=self._chrome_user_data_dir,
                 headless=True,
+                channel="chromium",
                 viewport={"width": 1440, "height": 2000},
                 locale="ko-KR",
                 user_agent=(
