@@ -421,7 +421,7 @@ def run() -> None:
 
     with tab_coupang:
         st.subheader("쿠팡 상품 키워드 분석")
-        st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시하는 전용 영역입니다. (크롤링 연결 전 UI 틀)")
+        st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시합니다.")
 
         c_input_col1, c_input_col2 = st.columns([3, 1])
         with c_input_col1:
@@ -442,23 +442,46 @@ def run() -> None:
             if not str(coupang_keyword).strip():
                 st.warning("키워드를 입력해주세요.")
             else:
-                st.info("현재는 크롤링 연결 전 단계입니다. 아래 결과 테이블은 표시용 틀입니다.")
+                with st.spinner("쿠팡 Top10 상품을 조회하는 중입니다..."):
+                    crawl_result = tool.coupang_crawler.crawl_coupang(str(coupang_keyword).strip())
+                st.session_state["coupang_last_result"] = crawl_result
 
-        top10_template = pd.DataFrame(
-            [
-                {
-                    "순위": rank,
-                    "상품명": "",
-                    "가격(원)": None,
-                    "리뷰수": None,
-                    "평점": None,
-                    "배송비": "",
-                    "상품 URL": "",
+        result = st.session_state.get("coupang_last_result", {})
+        top10_items = result.get("top10_items", []) if isinstance(result, dict) else []
+        if top10_items:
+            top10_df = pd.DataFrame(top10_items)
+            if not top10_df.empty:
+                rename_map = {
+                    "rank": "순위",
+                    "title": "상품명",
+                    "price": "가격(원)",
+                    "review_count": "리뷰수",
+                    "review_score": "평점",
+                    "shipping_fee": "배송비",
+                    "url": "상품 URL",
                 }
-                for rank in range(1, 11)
-            ]
-        )
-        st.dataframe(top10_template, use_container_width=True, hide_index=True)
+                top10_df = top10_df.rename(columns=rename_map)
+                ordered_cols = ["순위", "상품명", "가격(원)", "리뷰수", "평점", "배송비", "상품 URL"]
+                top10_df = top10_df[[c for c in ordered_cols if c in top10_df.columns]]
+                st.dataframe(top10_df, use_container_width=True, hide_index=True)
+        else:
+            top10_template = pd.DataFrame(
+                [
+                    {
+                        "순위": rank,
+                        "상품명": "",
+                        "가격(원)": None,
+                        "리뷰수": None,
+                        "평점": None,
+                        "배송비": "",
+                        "상품 URL": "",
+                    }
+                    for rank in range(1, 11)
+                ]
+            )
+            st.dataframe(top10_template, use_container_width=True, hide_index=True)
+            if isinstance(result, dict) and result.get("reason_code"):
+                st.warning(f"조회 결과가 없습니다. reason_code={result.get('reason_code')}")
         st.caption("표시 컬럼: 순위, 상품명, 가격, 리뷰수, 평점, 배송비, 상품 URL")
 
 
