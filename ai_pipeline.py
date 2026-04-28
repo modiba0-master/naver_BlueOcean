@@ -154,14 +154,57 @@ class AIPipeline:
         )
         return state
 
+    def _topic_particle(self, word: str) -> str:
+        """
+        Return Korean topic particle with simple Hangul-final check.
+        Fallback to 는 for non-Hangul endings.
+        """
+        if not word:
+            return "는"
+        ch = word[-1]
+        code = ord(ch)
+        if 0xAC00 <= code <= 0xD7A3:
+            has_final = ((code - 0xAC00) % 28) != 0
+            return "은" if has_final else "는"
+        return "는"
+
+    def _action_by_decision(self, decision: str, confidence: float) -> str:
+        if decision == "GO":
+            if confidence >= 0.75:
+                return "핵심 롱테일 2~3개로 바로 테스트 판매를 시작하세요."
+            return "소규모 예산으로 테스트 판매 후 지표를 재평가하세요."
+        if decision == "WATCH":
+            if confidence < 0.55:
+                return "데이터를 추가 수집한 뒤 재평가하고 보수적으로 접근하세요."
+            return "시장 반응을 관찰하며 진입 타이밍을 재점검하세요."
+        return "즉시 진입은 보류하고 롱테일 세분화 키워드로 재탐색하세요."
+
+    def _compute_confidence(self, payload: Dict[str, Any], risks: List[str], retrieved_count: int) -> float:
+        final = float(payload.get("final_score", 0.0) or 0.0)
+        base = 0.35 + (final / 100.0) * 0.45
+        # Data completeness bonus/penalty
+        has_reviews = payload.get("top10_avg_reviews") is not None
+        has_price = payload.get("top10_avg_price") is not None
+        if has_reviews and has_price:
+            base += 0.08
+        else:
+            base -= 0.07
+        # Retrieval evidence bonus
+        if retrieved_count > 0:
+            base += min(0.06, retrieved_count * 0.02)
+        # Risk penalty
+        base -= min(0.12, len(risks) * 0.03)
+        return round(max(0.30, min(0.92, base)), 2)
+
     def _node_build_insight(self, state: InsightState) -> InsightState:
         payload = state["payload"]
         opp = float(payload.get("opportunity_score", 0.0) or 0.0)
         com = float(payload.get("commercial_score", 0.0) or 0.0)
         final = float(payload.get("final_score", 0.0) or 0.0)
         decision = str(payload.get("decision_band", "WATCH"))
-        summary = f"{state['keyword']}은(는) 기회점수 {opp:.1f}, 판매가치 {com:.1f}, 최종 {final:.1f}로 {decision} 구간입니다."
-        action = "우선 테스트 판매를 진행하세요." if decision == "GO" else "시장 반응을 관찰하며 보수적으로 접근하세요."
+        topic = self._topic_particle(state["keyword"])
+        summary = f"{state['keyword']}{topic} 기회점수 {opp:.1f}, 판매가치 {com:.1f}, 최종 {final:.1f}로 {decision} 구간입니다."
+        action = self._action_by_decision(decision, confidence=0.6)
         evidence = [
             f"월검색량={int(payload.get('monthly_search_volume_est', 0) or 0)}",
             f"상품수={int(payload.get('product_count', 0) or 0)}",
@@ -173,7 +216,7 @@ class AIPipeline:
             "summary": summary,
             "action": action,
             "evidence": evidence,
-            "confidence": round(min(0.95, max(0.45, final / 100.0)), 2),
+            "confidence": 0.5,
             "model_version": self.settings.model_version,
         }
         state["logs"].append({"node_name": "buildInsight", "status": "SUCCESS"})
@@ -196,6 +239,13 @@ class AIPipeline:
 
     def _node_finalize(self, state: InsightState) -> InsightState:
         rec = state["recommendation"]
+        confidence = self._compute_confidence(
+            state["payload"],
+            state["risk_notes"],
+            retrieved_count=len(state["retrieved_cases"]),
+        )
+        rec["confidence"] = confidence
+        rec["action"] = self._action_by_decision(str(state["payload"].get("decision_band", "WATCH")), confidence)
         rec["risks"] = state["risk_notes"]
         rec["retrieved_cases"] = state["retrieved_cases"]
         state["recommendation"] = rec
