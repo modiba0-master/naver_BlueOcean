@@ -12,6 +12,57 @@ from db import query_market_score_rows
 from report_format import report_to_excel_bytes
 
 
+def _inject_tab_style() -> None:
+    st.markdown(
+        """
+        <style>
+        div[data-baseweb="tab-list"] {
+            gap: 0.5rem;
+            background: #f7fafc;
+            padding: 0.35rem;
+            border-radius: 0.8rem;
+            border: 1px solid #e2e8f0;
+        }
+        button[data-baseweb="tab"] {
+            border-radius: 0.65rem;
+            border: 1px solid #e2e8f0;
+            background: #ffffff;
+            padding: 0.5rem 0.8rem;
+            font-weight: 600;
+        }
+        button[data-baseweb="tab"][aria-selected="true"] {
+            background: #e6f4ff;
+            border-color: #8ec5ff;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _band_style(value: object) -> str:
+    band = str(value or "").upper().strip()
+    if band == "GO":
+        return "background-color: #e8f7ee; color: #166534; font-weight: 700;"
+    if band == "WATCH":
+        return "background-color: #fff7e6; color: #92400e; font-weight: 700;"
+    if band == "DROP":
+        return "background-color: #fdecec; color: #991b1b; font-weight: 700;"
+    return ""
+
+
+def _apply_band_filter(df: pd.DataFrame, selected_bands: List[str], go_only: bool) -> pd.DataFrame:
+    if "decision_band" not in df.columns:
+        return df
+    result = df.copy()
+    if go_only:
+        result = result[result["decision_band"].astype(str).str.upper() == "GO"]
+    elif selected_bands:
+        bands_upper = {b.upper() for b in selected_bands}
+        result = result[result["decision_band"].astype(str).str.upper().isin(bands_upper)]
+    return result
+
+
 def _period_to_range(label: str) -> Tuple[Optional[datetime], Optional[datetime]]:
     now = datetime.now()
     if label == "오늘":
@@ -81,6 +132,7 @@ def detect_naver_categories(seed_keyword: str, client_id: str, client_secret: st
 
 def run() -> None:
     st.set_page_config(page_title="Modiba BlueOcean", layout="wide")
+    _inject_tab_style()
     st.title("Modiba BlueOcean Web")
     st.caption("Railway 웹서비스용 - 관리자 인증 후 대시보드 접근")
 
@@ -119,6 +171,12 @@ def run() -> None:
         st.session_state["detected_categories"] = []
     if "detected_category_msg" not in st.session_state:
         st.session_state["detected_category_msg"] = ""
+    if "last_run_logs" not in st.session_state:
+        st.session_state["last_run_logs"] = []
+    if "last_run_summary" not in st.session_state:
+        st.session_state["last_run_summary"] = ""
+    if "last_run_report_df" not in st.session_state:
+        st.session_state["last_run_report_df"] = pd.DataFrame()
 
     with st.sidebar:
         st.subheader("실행 설정")
@@ -160,58 +218,79 @@ def run() -> None:
 
     tool = get_tool()
 
-    col1, col2 = st.columns([2, 3])
-    with col1:
+    if run_clicked:
+        if start_date > end_date:
+            st.error("시작일이 종료일보다 클 수 없습니다.")
+        else:
+            logs: List[str] = []
+
+            def _log(msg: str) -> None:
+                logs.append(msg)
+
+            with st.spinner("분석 중입니다. API 호출량에 따라 시간이 걸릴 수 있습니다."):
+                mode_value = "fast" if mode_label == "빠른 모드" else "precise"
+                summary, report_df = tool.start_analysis(
+                    seeds=seeds_text,
+                    start_date=start_date.strftime("%Y-%m-%d"),
+                    end_date=end_date.strftime("%Y-%m-%d"),
+                    analysis_mode=mode_value,
+                    log_callback=_log,
+                )
+            st.session_state["last_run_logs"] = logs
+            st.session_state["last_run_summary"] = summary or ""
+            st.session_state["last_run_report_df"] = report_df if report_df is not None else pd.DataFrame()
+
+    tab_log, tab_market, tab_coupang = st.tabs(
+        ["📋 1. 실행로그", "📈 2. 시장성 점수조회", "🛒 3. 쿠팡 상품 키워드 분석"]
+    )
+
+    with tab_log:
         st.subheader("실행 로그")
-        if run_clicked:
-            if start_date > end_date:
-                st.error("시작일이 종료일보다 클 수 없습니다.")
+        last_logs = st.session_state.get("last_run_logs", [])
+        last_summary = str(st.session_state.get("last_run_summary", "")).strip()
+        last_report_df = st.session_state.get("last_run_report_df", pd.DataFrame())
+
+        if last_logs or last_summary:
+            st.code("\n".join(last_logs) if last_logs else "로그 없음")
+            if last_summary:
+                st.success(f"분석 완료: {last_summary}")
             else:
-                logs: List[str] = []
-
-                def _log(msg: str) -> None:
-                    logs.append(msg)
-
-                with st.spinner("분석 중입니다. API 호출량에 따라 시간이 걸릴 수 있습니다."):
-                    mode_value = "fast" if mode_label == "빠른 모드" else "precise"
-                    summary, report_df = tool.start_analysis(
-                        seeds=seeds_text,
-                        start_date=start_date.strftime("%Y-%m-%d"),
-                        end_date=end_date.strftime("%Y-%m-%d"),
-                        analysis_mode=mode_value,
-                        log_callback=_log,
-                    )
-                st.code("\n".join(logs) if logs else "로그 없음")
-                if summary:
-                    st.success(f"분석 완료: {summary}")
-                else:
-                    st.warning("결과가 없어 저장되지 않았습니다.")
-                if report_df is not None and not report_df.empty:
-                    st.subheader("리포트 미리보기 (템플릿 8열)")
-                    st.dataframe(report_df, use_container_width=True, hide_index=True)
-                    ts = datetime.now().strftime("%Y%m%d_%H%M")
-                    xlsx = report_to_excel_bytes(report_df)
-                    st.download_button(
-                        label="엑셀 다운로드 (모디바 카테고리별 TOP10 형식)",
-                        data=xlsx,
-                        file_name=f"모디바_카테고리별_TOP10_추천분석서_{ts}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
+                st.warning("결과가 없어 저장되지 않았습니다.")
+            if isinstance(last_report_df, pd.DataFrame) and not last_report_df.empty:
+                st.subheader("리포트 미리보기 (템플릿 8열)")
+                st.dataframe(last_report_df, use_container_width=True, hide_index=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M")
+                xlsx = report_to_excel_bytes(last_report_df)
+                st.download_button(
+                    label="엑셀 다운로드 (모디바 카테고리별 TOP10 형식)",
+                    data=xlsx,
+                    file_name=f"모디바_카테고리별_TOP10_추천분석서_{ts}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="dl_analysis_report",
+                )
         else:
             st.info("왼쪽 사이드바에서 조건을 설정하고 `분석 실행`을 눌러주세요.")
 
-    with col2:
+    with tab_market:
         st.subheader("시장성 점수 조회 (DB)")
         st.caption("최종 점수 = 수요 점수 × 트렌드 점수 × 전환 점수 ÷ 경쟁 점수")
 
-        filter_col1, filter_col2, filter_col3 = st.columns([2, 1, 1])
+        filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([2, 1, 1, 1])
         with filter_col1:
             keyword_like = st.text_input("키워드 필터", value="")
         with filter_col2:
             period = st.selectbox("기간", ["오늘", "최근 7일", "최근 30일", "최근 60일", "최근 120일", "전체"], index=1)
         with filter_col3:
             limit = st.selectbox("건수", [20, 50, 100, 200], index=1)
+        with filter_col4:
+            sort_by = st.selectbox("정렬", ["2차 최종 점수", "최종 점수", "월검색량(수요)", "분석시각"], index=0)
+
+        band_col1, band_col2 = st.columns([3, 1])
+        with band_col1:
+            selected_bands = st.multiselect("판단 밴드", ["GO", "WATCH", "DROP"], default=["GO", "WATCH", "DROP"])
+        with band_col2:
+            go_only = st.checkbox("GO만 보기", value=False)
 
         started_from, started_to = _period_to_range(period)
 
@@ -228,6 +307,17 @@ def run() -> None:
 
         if score_rows:
             score_df = pd.DataFrame(score_rows)
+            score_df = _apply_band_filter(score_df, selected_bands, go_only)
+            sort_map = {
+                "2차 최종 점수": ("final_score", False),
+                "최종 점수": ("market_score", False),
+                "월검색량(수요)": ("monthly_search_volume_est", False),
+                "분석시각": ("started_at", False),
+            }
+            sort_col, ascending = sort_map.get(sort_by, ("final_score", False))
+            if sort_col in score_df.columns:
+                score_df = score_df.sort_values(by=sort_col, ascending=ascending, na_position="last")
+
             show_cols = [
                 "started_at",
                 "seed_keyword",
@@ -267,7 +357,15 @@ def run() -> None:
                     "top10_avg_price": "쿠팡 Top10 평균가격",
                 }
             )
-            st.dataframe(view_df, use_container_width=True, hide_index=True)
+            st.caption("밴드 색상: GO(초록) · WATCH(주황) · DROP(빨강)")
+            if "판단 밴드" in view_df.columns:
+                st.dataframe(
+                    view_df.style.map(_band_style, subset=["판단 밴드"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.dataframe(view_df, use_container_width=True, hide_index=True)
 
             insight_cols = [
                 "keyword_text",
@@ -320,6 +418,108 @@ def run() -> None:
             )
         else:
             st.info("조회 결과가 없습니다.")
+
+    with tab_coupang:
+        st.subheader("쿠팡 상품 키워드 분석")
+        st.caption("시장성 결과 중 쿠팡 Top10 기반 지표(상품수/평균리뷰수/평균가격)를 별도 확인합니다.")
+
+        c_filter_col1, c_filter_col2, c_filter_col3 = st.columns([2, 1, 1])
+        with c_filter_col1:
+            coupang_keyword_like = st.text_input("키워드 필터", value="", key="coupang_keyword_like")
+        with c_filter_col2:
+            coupang_limit = st.selectbox("건수", [20, 50, 100, 200], index=1, key="coupang_limit")
+        with c_filter_col3:
+            coupang_sort = st.selectbox(
+                "정렬",
+                ["판매가치 점수", "2차 최종 점수", "쿠팡 Top10 평균리뷰수", "쿠팡 Top10 평균가격", "분석시각"],
+                index=0,
+                key="coupang_sort",
+            )
+
+        c_band_col1, c_band_col2 = st.columns([3, 1])
+        with c_band_col1:
+            coupang_bands = st.multiselect(
+                "판단 밴드",
+                ["GO", "WATCH", "DROP"],
+                default=["GO", "WATCH", "DROP"],
+                key="coupang_bands",
+            )
+        with c_band_col2:
+            coupang_go_only = st.checkbox("GO만 보기", value=False, key="coupang_go_only")
+
+        try:
+            coupang_rows = query_market_score_rows(
+                limit=int(coupang_limit),
+                keyword_like=(coupang_keyword_like or "").strip() or None,
+                started_from=None,
+                started_to=None,
+            )
+        except Exception as e:
+            st.error(f"쿠팡 분석 조회 실패: {e}")
+            coupang_rows = []
+
+        if coupang_rows:
+            coupang_df = pd.DataFrame(coupang_rows)
+            coupang_df = _apply_band_filter(coupang_df, coupang_bands, coupang_go_only)
+            coupang_sort_map = {
+                "판매가치 점수": ("commercial_score", False),
+                "2차 최종 점수": ("final_score", False),
+                "쿠팡 Top10 평균리뷰수": ("top10_avg_reviews", False),
+                "쿠팡 Top10 평균가격": ("top10_avg_price", False),
+                "분석시각": ("started_at", False),
+            }
+            c_sort_col, c_ascending = coupang_sort_map.get(coupang_sort, ("commercial_score", False))
+            if c_sort_col in coupang_df.columns:
+                coupang_df = coupang_df.sort_values(by=c_sort_col, ascending=c_ascending, na_position="last")
+            coupang_cols = [
+                "started_at",
+                "seed_keyword",
+                "keyword_text",
+                "product_count",
+                "top10_avg_reviews",
+                "top10_avg_price",
+                "conversion_score",
+                "commercial_score",
+                "final_score",
+                "decision_band",
+            ]
+            coupang_cols = [c for c in coupang_cols if c in coupang_df.columns]
+            coupang_view_df = coupang_df[coupang_cols].rename(
+                columns={
+                    "started_at": "분석시각",
+                    "seed_keyword": "주제어",
+                    "keyword_text": "키워드",
+                    "product_count": "쿠팡 상품수",
+                    "top10_avg_reviews": "쿠팡 Top10 평균리뷰수",
+                    "top10_avg_price": "쿠팡 Top10 평균가격",
+                    "conversion_score": "전환 점수",
+                    "commercial_score": "판매가치 점수",
+                    "final_score": "2차 최종 점수",
+                    "decision_band": "판단 밴드",
+                }
+            )
+            st.caption("밴드 색상: GO(초록) · WATCH(주황) · DROP(빨강)")
+            if "판단 밴드" in coupang_view_df.columns:
+                st.dataframe(
+                    coupang_view_df.style.map(_band_style, subset=["판단 밴드"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.dataframe(coupang_view_df, use_container_width=True, hide_index=True)
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+            xlsx_coupang = report_to_excel_bytes(coupang_view_df)
+            st.download_button(
+                label="엑셀 다운로드 (쿠팡 상품 키워드 분석 결과)",
+                data=xlsx_coupang,
+                file_name=f"모디바_쿠팡_상품키워드_분석결과_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_coupang_analysis_report",
+                use_container_width=True,
+            )
+        else:
+            st.info("쿠팡 분석 지표 조회 결과가 없습니다.")
 
 
 if __name__ == "__main__":

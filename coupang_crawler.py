@@ -1,37 +1,31 @@
-import atexit
 import argparse
+import atexit
 import os
 import random
 import re
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from playwright.sync_api import BrowserContext, Error, Page, Playwright, TimeoutError, sync_playwright
 
-HEADLESS = True  # 운영 기본값: True (개발 시 환경변수로 끌 수 있음)
+HEADLESS = True
 
 
 class CoupangCrawler:
-    """
-    캐시 + requests + selenium fallback 기반 쿠팡 크롤러.
-    - cache key: keyword_YYYYMMDD (기본 24h TTL 효과)
-    - requests 실패/파싱 실패 시 selenium fallback
-    - selenium driver 재사용
-    """
+    """Playwright 기반 쿠팡 검색 Top10 수집기."""
 
     def __init__(self) -> None:
-        self._cache: Dict[str, Dict[str, float]] = {}
-        self._last_success_cache: Dict[str, Dict[str, float]] = {}
-        self._driver: Optional[webdriver.Chrome] = None
-        self._stats = {"cache_hit": 0, "requests_ok": 0, "selenium_ok": 0, "failed": 0}
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._last_success_cache: Dict[str, Dict[str, Any]] = {}
+        self._stats = {"cache_hit": 0, "requests_ok": 0, "playwright_ok": 0, "failed": 0, "blocked": 0}
+        self._last_fetch_source = "unknown"
+        self._playwright: Optional[Playwright] = None
+        self._context: Optional[BrowserContext] = None
+        self._page: Optional[Page] = None
         env_raw = str(os.environ.get("COUPANG_HEADLESS", "")).strip().lower()
         if env_raw in {"0", "false", "n", "no"}:
             self._headless = False
@@ -39,10 +33,10 @@ class CoupangCrawler:
             self._headless = True
         else:
             self._headless = HEADLESS
+
         self._chrome_user_data_dir = str(os.environ.get("COUPANG_CHROME_USER_DATA_DIR", "")).strip()
         self._chrome_profile = str(os.environ.get("COUPANG_CHROME_PROFILE", "")).strip()
         if not self._chrome_user_data_dir:
-            # 전용 세션 저장 기본 경로(프로젝트 내부) - 기존 사용자 기본 프로필 충돌 방지
             self._chrome_user_data_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
                 ".coupang_chrome_profile",
@@ -63,144 +57,308 @@ class CoupangCrawler:
         except Exception:
             return None
 
-    def _first_match_text(self, node, selectors: List[str]) -> str:
-        for sel in selectors:
-            one = node.select_one(sel)
-            if one is not None:
-                txt = one.get_text(strip=True)
-                if txt:
-                    return txt
-        return ""
+    def _parse_float(self, text: str) -> Optional[float]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", raw)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
 
-    def _extract_from_html(self, html: str) -> Tuple[int, List[float], List[float]]:
-        soup = BeautifulSoup(html, "html.parser")
-        product_selectors = [
-            "li.search-product",
-            "li[data-product-id]",
-            "ul.search-product-list > li",
-        ]
-        products = []
-        for sel in product_selectors:
-            products = soup.select(sel)
-            if products:
-                break
-        product_count = len(products)
-
-        prices: List[float] = []
-        reviews: List[float] = []
-        ad_selectors = [".search-product__ad", ".badge.ad-badge-text", ".name.ad-badge-text"]
-        price_selectors = [".price-value", ".sale-price", ".price > strong", ".price em"]
-        review_selectors = [".rating-total-count", ".rating-count", ".rating em", ".count"]
-        for li in products:
-            if any(li.select_one(x) is not None for x in ad_selectors):
-                continue
-            price_txt = self._first_match_text(li, price_selectors)
-            review_txt = self._first_match_text(li, review_selectors)
-            if not price_txt or not review_txt:
-                continue
-            p = self._parse_int(price_txt)
-            r = self._parse_int(review_txt)
-            if p is None or r is None:
-                continue
-            prices.append(float(p))
-            reviews.append(float(r))
-            if len(prices) >= 10:
-                break
-        return product_count, reviews, prices
-
-    def _build_result(self, product_count: int, reviews: List[float], prices: List[float]) -> Dict[str, float]:
-        if len(reviews) < 3 or len(prices) < 3:
-            return {"product_count": int(product_count), "avg_reviews": 0.0, "avg_price": 0.0}
+    def _build_result(self, product_count: int, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        reviews = [float(it["review_count"]) for it in items if it.get("review_count") is not None]
+        prices = [float(it["price"]) for it in items if it.get("price") is not None]
+        if len(reviews) < 1 or len(prices) < 1:
+            return {"product_count": int(product_count), "avg_reviews": 0.0, "avg_price": 0.0, "top10_items": items}
         return {
             "product_count": int(product_count),
             "avg_reviews": round(sum(reviews) / len(reviews), 2),
             "avg_price": round(sum(prices) / len(prices), 2),
+            "top10_items": items,
         }
 
-    def _default_result(self) -> Dict[str, float]:
-        return {"product_count": 0, "avg_reviews": 0.0, "avg_price": 0.0}
+    def _default_result(self) -> Dict[str, Any]:
+        return {
+            "product_count": 0,
+            "avg_reviews": 0.0,
+            "avg_price": 0.0,
+            "top10_items": [],
+            "reason_code": "NO_RESULT",
+        }
 
-    def get_cached_result(self, keyword: str) -> Optional[Dict[str, float]]:
+    def _result_with_reason(self, reason_code: str) -> Dict[str, Any]:
+        one = self._default_result()
+        one["reason_code"] = reason_code
+        return one
+
+    def _build_search_url(self, keyword: str) -> str:
+        # 기본 검색 URL 형태를 유지하되, 쿠팡 쿼리 파라미터와 유사하게 component/traceId/channel 포함
+        trace = f"bo{int(time.time())}{random.randint(100, 999)}"
+        return (
+            f"https://www.coupang.com/np/search?component=&q={quote(keyword)}"
+            f"&traceId={trace}&channel=user"
+        )
+
+    def _is_blocked(self, html: str, title: str = "") -> bool:
+        text = f"{title}\n{html}".lower()
+        blocked_signals = [
+            "access denied",
+            "robot",
+            "automated queries",
+            "captcha",
+            "서비스 이용에 불편",
+            "차단",
+        ]
+        return any(sig in text for sig in blocked_signals)
+
+    def _parse_top10_from_html(self, html: str) -> tuple[int, List[Dict[str, Any]]]:
+        parser = "lxml"
+        try:
+            soup = BeautifulSoup(html, parser)
+        except Exception:
+            soup = BeautifulSoup(html, "html.parser")
+
+        # 구버전/신버전 결과 DOM 모두 대응
+        products = soup.select("li.ProductUnit_productUnit__Qd6sv")
+        if not products:
+            products = soup.select("li.search-product")
+        if not products:
+            products = soup.select("ul#product-list > li")
+        items: List[Dict[str, Any]] = []
+        rank_no = 0
+        for li in products:
+            # 광고 상품 제외
+            is_ad = bool(
+                li.select_one(
+                    ".search-product__ad-badge, .search-product__ad, .ad-badge-text"
+                )
+            )
+            # classes with [] are hard to select safely with CSS parser; fallback to text scan
+            if not is_ad:
+                li_text = li.get_text(" ", strip=True)
+                has_rank_mark = li.select_one("[class*='RankMark_rank']") is not None
+                if "광고" in li_text and not has_rank_mark:
+                    is_ad = True
+            if is_ad:
+                continue
+            title_node = li.select_one(".ProductUnit_productNameV2__cV9cw, .name")
+            price_node = li.select_one(
+                ".PriceArea_priceArea__NntJz [class*='fw-text-'], "
+                ".PriceArea_priceArea__NntJz .price-value, "
+                ".sale-price strong, .sale-price em"
+            )
+            review_count_node = li.select_one(
+                ".ProductRating_productRating__jjf7W [class*='fw-text-'], "
+                ".rating-total-count, .rating-count, .count"
+            )
+            review_score_node = li.select_one(
+                ".ProductRating_productRating__jjf7W [aria-label], "
+                ".star .rating"
+            )
+            # 배송비/배송정보 텍스트: 배송비 N원, 무료배송, 무료반품 등
+            shipping_fee_node = li.select_one(
+                ".TextBadge_feePrice__n_gta, "
+                "[class*='fw-bg-'], .fw-bg-bluegray-100, "
+                "[data-badge-type='feePrice']"
+            )
+            link_node = li.select_one("a[href]")
+
+            title = title_node.get_text(strip=True) if title_node else ""
+            price_raw = price_node.get_text(strip=True) if price_node else ""
+            review_count_raw = review_count_node.get_text(strip=True) if review_count_node else ""
+            review_score_raw = ""
+            if review_score_node is not None:
+                review_score_raw = str(
+                    review_score_node.get("aria-label", "") or review_score_node.get_text(strip=True) or ""
+                )
+            shipping_fee_raw = shipping_fee_node.get_text(strip=True) if shipping_fee_node else ""
+            price_num = self._parse_int(price_raw)
+            review_num = self._parse_int(review_count_raw)
+            review_score = self._parse_float(review_score_raw)
+            url = ""
+            if link_node is not None:
+                href = str(link_node.get("href", "")).strip()
+                if href.startswith("http"):
+                    url = href
+                elif href.startswith("/"):
+                    url = f"https://www.coupang.com{href}"
+
+            if not title or price_num is None:
+                continue
+            rank_no += 1
+            items.append(
+                {
+                    "rank": rank_no,
+                    "title": title,
+                    "price": float(price_num),
+                    "review_count": float(review_num) if review_num is not None else None,
+                    "review_score": float(review_score) if review_score is not None else None,
+                    "shipping_fee": shipping_fee_raw or None,
+                    "url": url,
+                }
+            )
+            if len(items) >= 10:
+                break
+        return len(products), items
+
+    def get_cached_result(self, keyword: str) -> Optional[Dict[str, Any]]:
         key = str(keyword or "").strip()
         if not key:
             return None
         one = self._last_success_cache.get(key)
         return dict(one) if one is not None else None
 
-    def _crawl_with_requests(self, keyword: str) -> Optional[Dict[str, float]]:
-        url = f"https://www.coupang.com/np/search?q={requests.utils.quote(keyword)}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        }
-        for _ in range(2):  # retry 1회
-            try:
-                res = requests.get(url, headers=headers, timeout=10)
-                print(f"[Crawler][requests] keyword={keyword} status={res.status_code} body_len={len(res.text)}")
-                if res.status_code != 200:
-                    continue
-                product_count, reviews, prices = self._extract_from_html(res.text)
-                print(
-                    f"[Crawler][requests] parsed keyword={keyword} "
-                    f"product_count={product_count} reviews={len(reviews)} prices={len(prices)}"
-                )
-                if product_count <= 0:
-                    continue
-                result = self._build_result(product_count, reviews, prices)
-                if result["avg_reviews"] > 0 and result["avg_price"] > 0:
-                    return result
-            except Exception as e:
-                print(f"[Crawler Error] keyword={keyword}, error={e}")
-                continue
-        return None
-
-    def _get_driver(self, force_headless: Optional[bool] = None) -> Optional[webdriver.Chrome]:
-        if self._driver is not None:
-            return self._driver
+    def _get_page(self, force_headless: Optional[bool] = None) -> Optional[Page]:
+        if self._page is not None:
+            return self._page
         try:
-            options = Options()
             use_headless = self._headless if force_headless is None else bool(force_headless)
-            # 개발 시 False / 운영 시 True: COUPANG_HEADLESS 환경변수로 제어
-            if use_headless:
-                options.add_argument("--headless=new")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            options.add_experimental_option("useAutomationExtension", False)
-            options.add_argument(
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            self._playwright = sync_playwright().start()
+            self._context = self._playwright.chromium.launch_persistent_context(
+                user_data_dir=self._chrome_user_data_dir,
+                channel="chrome",
+                headless=use_headless,
+                viewport={"width": 1440, "height": 2000},
+                locale="ko-KR",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    f"--profile-directory={self._chrome_profile}",
+                ],
+            )
+            # 기존 탭 상태(이전 검색/광고 리디렉션) 영향을 피하기 위해 항상 새 탭 사용
+            page = self._context.new_page()
+            page.set_default_timeout(15000)
+            self._page = page
+            return self._page
+        except Error as e:
+            # cp949 콘솔에서도 깨지지 않도록 안전 문자열로 출력
+            safe_msg = str(e).encode("cp949", errors="ignore").decode("cp949", errors="ignore")
+            print(f"[Crawler Error] keyword=PLAYWRIGHT_INIT, error={safe_msg}")
+            return None
+
+    def open_home_ready_session(self, wait_seconds: int = 120) -> bool:
+        """
+        쿠팡 홈 접속까지만 수행하고 사용자의 수동 조작을 기다린다.
+        """
+        if self._page is not None:
+            self.close()
+        page = self._get_page(force_headless=False)
+        if page is None:
+            return False
+        try:
+            page.goto("https://www.coupang.com", wait_until="domcontentloaded")
+            if self._is_blocked(page.content(), page.title()):
+                print("[Ready] 쿠팡 접속이 차단되었습니다. (Access Denied/CAPTCHA)")
+                self._stats["blocked"] += 1
+                return False
+            page.wait_for_selector("input[name='q'], input[placeholder*='검색']", timeout=15000)
+            print("[Ready] 쿠팡 홈 접속 완료. 검색창 입력 가능 상태입니다.")
+            print("[Ready] 이 창에서 직접 키워드를 입력해 주세요.")
+            print(f"[Ready] 대기시간: {wait_seconds}초")
+            time.sleep(max(10, int(wait_seconds)))
+            return True
+        except Exception as e:
+            print(f"[Crawler Error] keyword=OPEN_HOME_READY, error={e!r}")
+            return False
+        finally:
+            self.close()
+
+    def _simulate_human_actions(self, page: Page) -> None:
+        try:
+            page.wait_for_timeout(random.randint(500, 1200))
+            page.mouse.move(random.randint(200, 700), random.randint(200, 550), steps=random.randint(10, 30))
+            page.wait_for_timeout(random.randint(300, 800))
+            page.mouse.wheel(0, random.randint(500, 1200))
+            page.wait_for_timeout(random.randint(400, 900))
+            page.mouse.wheel(0, random.randint(-250, 100))
+            page.wait_for_timeout(random.randint(300, 700))
+        except Exception:
+            return
+
+    def _session_headers_from_page(self, page: Page) -> Dict[str, str]:
+        try:
+            ua = str(page.evaluate("() => navigator.userAgent"))
+        except Exception:
+            ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
-            if self._chrome_user_data_dir:
-                options.add_argument(f"--user-data-dir={self._chrome_user_data_dir}")
-            if self._chrome_profile:
-                options.add_argument(f"--profile-directory={self._chrome_profile}")
-            self._driver = webdriver.Chrome(options=options)
-            self._driver.implicitly_wait(3)
-            self._driver.execute_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        }
+        return headers
+
+    def _requests_with_browser_session(self, page: Page, search_url: str) -> Optional[Dict[str, Any]]:
+        if self._context is None:
+            return None
+        try:
+            storage = self._context.storage_state()
+            cookies = storage.get("cookies", []) if isinstance(storage, dict) else []
+            jar = requests.cookies.RequestsCookieJar()
+            for c in cookies:
+                jar.set(
+                    str(c.get("name", "")),
+                    str(c.get("value", "")),
+                    domain=str(c.get("domain", "")).lstrip("."),
+                    path=str(c.get("path", "/")),
+                )
+            headers = self._session_headers_from_page(page)
+            parsed = urlparse(search_url)
+            q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            q["component"] = q.get("component", "")
+            q["channel"] = q.get("channel", "user")
+            req_url = urlunparse(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    urlencode(q, doseq=True),
+                    parsed.fragment,
+                )
             )
-            return self._driver
-        except WebDriverException as e:
-            print(f"[Crawler Error] keyword=DRIVER_INIT, error={e}")
+            res = requests.get(req_url, headers=headers, cookies=jar, timeout=12, allow_redirects=True)
+            if res.status_code != 200:
+                print(f"[Crawler][requests] status={res.status_code}")
+                return None
+            if self._is_blocked(res.text, ""):
+                print("[Crawler][requests] blocked signal detected")
+                self._stats["blocked"] += 1
+                return None
+            product_count, items = self._parse_top10_from_html(res.text)
+            print(f"[Crawler][requests] parsed product_count={product_count} top10_items={len(items)}")
+            if product_count <= 0:
+                return None
+            self._last_fetch_source = "requests"
+            return self._build_result(product_count, items)
+        except Exception as e:
+            print(f"[Crawler Error] keyword=REQUESTS_SESSION, error={e!r}")
             return None
 
     def bootstrap_login_session(self, wait_seconds: int = 120) -> bool:
-        """
-        로그인 세션 저장용 1회 실행:
-        - 전용 프로필(non-headless)로 쿠팡 로그인 페이지를 연다.
-        - 사용자가 수동 로그인할 시간을 wait_seconds 만큼 제공한다.
-        """
-        if self._driver is not None:
+        if self._page is not None:
             self.close()
-        driver = self._get_driver(force_headless=False)
-        if driver is None:
+        page = self._get_page(force_headless=False)
+        if page is None:
             return False
         try:
-            driver.get("https://www.coupang.com/np/coupanglogin/login")
+            page.goto("https://www.coupang.com/np/coupanglogin/login", wait_until="domcontentloaded")
             print("[Bootstrap] 쿠팡 로그인 페이지를 열었습니다.")
             print(f"[Bootstrap] 아래 경로에 세션이 저장됩니다: {self._chrome_user_data_dir}")
             print(f"[Bootstrap] {wait_seconds}초 내 수동 로그인 후 창을 그대로 두세요.")
@@ -213,92 +371,201 @@ class CoupangCrawler:
         finally:
             self.close()
 
-    def _crawl_with_selenium(self, keyword: str) -> Optional[Dict[str, float]]:
-        driver = self._get_driver()
-        if driver is None:
+    def open_search_ready_session(self, wait_seconds: int = 120) -> bool:
+        """
+        쿠팡 메인 페이지까지만 접속하고,
+        사용자가 검색어를 직접 입력할 수 있도록 대기한다.
+        """
+        if self._page is not None:
+            self.close()
+        page = self._get_page(force_headless=False)
+        if page is None:
+            return False
+        try:
+            page.goto("https://www.coupang.com", wait_until="domcontentloaded")
+            if self._is_blocked(page.content(), page.title()):
+                print("[Ready] 쿠팡 접속이 차단되었습니다. (Access Denied/CAPTCHA)")
+                self._stats["blocked"] += 1
+                return False
+            page.wait_for_selector("input[name='q'], input[placeholder*='검색']", timeout=15000)
+            self._simulate_human_actions(page)
+            print("[Ready] 쿠팡 메인 페이지 접속 완료.")
+            print("[Ready] 검색창에 키워드를 직접 입력해 주세요.")
+            print(f"[Ready] {wait_seconds}초 동안 브라우저를 유지합니다.")
+            time.sleep(max(10, int(wait_seconds)))
+            print("[Ready] 수동 입력 대기 모드를 종료합니다.")
+            return True
+        except Exception as e:
+            print(f"[Crawler Error] keyword=OPEN_SEARCH_READY, error={e!r}")
+            return False
+        finally:
+            self.close()
+
+    def open_google_ready_session(self, wait_seconds: int = 180) -> bool:
+        """
+        Google 홈 화면만 열어두고 사용자의 수동 검색/이동을 기다린다.
+        """
+        if self._page is not None:
+            self.close()
+        page = self._get_page(force_headless=False)
+        if page is None:
+            return False
+        try:
+            page.goto("https://www.google.com/ncr", wait_until="domcontentloaded")
+            # hidden input 말고 실제 보이는 검색창만 대상
+            page.wait_for_selector("textarea[name='q'], input[name='q']:not([type='hidden'])", timeout=15000)
+            print("[Ready] Google 홈 화면이 열렸습니다.")
+            print("[Ready] 직접 검색 후 쿠팡 결과 페이지 URL을 복사해 전달해 주세요.")
+            print(f"[Ready] {wait_seconds}초 동안 브라우저를 유지합니다.")
+            time.sleep(max(10, int(wait_seconds)))
+            return True
+        except Exception as e:
+            print(f"[Crawler Error] keyword=OPEN_GOOGLE_READY, error={e!r}")
+            return False
+        finally:
+            self.close()
+
+    def parse_coupang_search_url(self, search_url: str) -> Dict[str, Any]:
+        """
+        사용자가 전달한 쿠팡 검색 결과 URL만 파싱한다.
+        """
+        url = str(search_url or "").strip()
+        if not url:
+            return self._result_with_reason("EMPTY_URL")
+        if "coupang.com/np/search" not in url:
+            return self._result_with_reason("INVALID_URL")
+
+        page = self._get_page(force_headless=True)
+        if page is None:
+            return self._result_with_reason("PLAYWRIGHT_INIT_FAILED")
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            html = page.content()
+            if self._is_blocked(html, page.title()):
+                self._stats["blocked"] += 1
+                return self._result_with_reason("BLOCKED_BY_WAF")
+
+            page.wait_for_selector("li.search-product", timeout=10000)
+            page.wait_for_timeout(800)
+            html = page.content()
+            product_count, items = self._parse_top10_from_html(html)
+            if product_count <= 0:
+                return self._result_with_reason("NO_PRODUCTS")
+            out = self._build_result(product_count, items)
+            out["reason_code"] = "OK"
+            return out
+        except TimeoutError:
+            return self._result_with_reason("TIMEOUT")
+        except Exception as e:
+            print(f"[Crawler Error] keyword=PARSE_URL, error={e!r}")
+            return self._result_with_reason("PARSE_FAILED")
+        finally:
+            self.close()
+
+    def _crawl_with_playwright(self, keyword: str) -> Optional[Dict[str, Any]]:
+        page = self._get_page()
+        if page is None:
             return None
         try:
-            url = f"https://www.coupang.com/np/search?q={requests.utils.quote(keyword)}"
-            driver.get(url)
-            print(f"[Crawler][selenium] loaded keyword={keyword} current_url={driver.current_url}")
-            wait = WebDriverWait(driver, 8)
-            wait.until(
-                EC.any_of(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "li.search-product")),
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "li[data-product-id]")),
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "ul.search-product-list > li")),
-                )
-            )
-            # Selenium fallback 경로에서만 짧은 랜덤 대기
-            time.sleep(random.uniform(1.0, 2.0))
-            page_title = ""
-            try:
-                page_title = str(driver.title or "")
-            except Exception:
-                page_title = ""
+            url = self._build_search_url(keyword)
+            page.goto(url, wait_until="domcontentloaded")
+            if self._is_blocked(page.content(), page.title()):
+                print("[Crawler][playwright] blocked signal detected after initial load")
+                self._stats["blocked"] += 1
+                return None
+            self._simulate_human_actions(page)
+
+            # 1차: 브라우저 세션 쿠키/UA를 반영한 requests 파싱
+            req_result = self._requests_with_browser_session(page, url)
+            if req_result is not None:
+                return req_result
+
+            # 2차: Playwright 페이지 콘텐츠 직접 파싱 fallback
+            page.wait_for_selector("li.search-product", timeout=12000)
+            page.wait_for_timeout(random.randint(900, 1600))
             print(
-                f"[Crawler][selenium] ready keyword={keyword} "
-                f"title={page_title[:80]} page_len={len(driver.page_source)}"
+                f"[Crawler][playwright] ready keyword={keyword} "
+                f"title={page.title()[:80]} url={page.url}"
             )
-            product_count, reviews, prices = self._extract_from_html(driver.page_source)
+            html = page.content()
+            if self._is_blocked(html, page.title()):
+                print("[Crawler][playwright] blocked signal detected before parsing")
+                self._stats["blocked"] += 1
+                return None
+            product_count, items = self._parse_top10_from_html(html)
             print(
-                f"[Crawler][selenium] parsed keyword={keyword} "
-                f"product_count={product_count} reviews={len(reviews)} prices={len(prices)}"
+                f"[Crawler][playwright] parsed keyword={keyword} "
+                f"product_count={product_count} top10_items={len(items)}"
             )
             if product_count <= 0:
                 return None
-            if len(reviews) < 3 or len(prices) < 3:
-                return self.get_cached_result(keyword) or self._default_result()
-            return self._build_result(product_count, reviews, prices)
+            self._last_fetch_source = "playwright"
+            return self._build_result(product_count, items)
+        except TimeoutError as e:
+            print(f"[Crawler Error] keyword={keyword}, error=timeout, detail={e}")
+            return None
         except Exception as e:
             try:
-                cur = driver.current_url if driver else "N/A"
-                title = (driver.title if driver else "N/A") or "N/A"
+                cur = page.url if page else "N/A"
+                title = (page.title() if page else "N/A") or "N/A"
             except Exception:
                 cur = "N/A"
                 title = "N/A"
             print(f"[Crawler Error] keyword={keyword}, current_url={cur}, title={title}, error={e!r}")
             return None
 
-    def crawl_coupang(self, keyword: str) -> Dict[str, float]:
+    def crawl_coupang(self, keyword: str) -> Dict[str, Any]:
         kw = str(keyword or "").strip()
         if not kw:
-            return self._default_result()
+            return self._result_with_reason("EMPTY_KEYWORD")
 
         ck = self._cache_key(kw)
         if ck in self._cache:
             self._stats["cache_hit"] += 1
             return dict(self._cache[ck])
 
-        # 1차: requests (retry 1회)
-        req_result = self._crawl_with_requests(kw)
-        if req_result is not None:
-            self._cache[ck] = req_result
-            self._last_success_cache[kw] = req_result
-            self._stats["requests_ok"] += 1
-            return dict(req_result)
-
-        # 2차: selenium fallback
-        sel_result = self._crawl_with_selenium(kw)
-        if sel_result is not None:
-            self._cache[ck] = sel_result
-            self._last_success_cache[kw] = sel_result
-            self._stats["selenium_ok"] += 1
-            return dict(sel_result)
+        result = self._crawl_with_playwright(kw)
+        if result is not None:
+            self._cache[ck] = result
+            self._last_success_cache[kw] = result
+            if self._last_fetch_source == "requests":
+                self._stats["requests_ok"] += 1
+            else:
+                self._stats["playwright_ok"] += 1
+            result["reason_code"] = "OK"
+            return dict(result)
 
         self._stats["failed"] += 1
-        return self.get_cached_result(kw) or self._default_result()
+        cached = self.get_cached_result(kw)
+        if cached is not None:
+            cached["reason_code"] = "CACHE_FALLBACK"
+            return cached
+        if self._stats.get("blocked", 0) > 0:
+            return self._result_with_reason("BLOCKED_BY_WAF")
+        return self._result_with_reason("CRAWL_FAILED")
 
     def get_stats(self) -> Dict[str, int]:
         return dict(self._stats)
 
     def close(self) -> None:
-        if self._driver is not None:
+        if self._page is not None:
             try:
-                self._driver.quit()
+                self._page.close()
             except Exception:
                 pass
-            self._driver = None
+            self._page = None
+        if self._context is not None:
+            try:
+                self._context.close()
+            except Exception:
+                pass
+            self._context = None
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
 
 
 _shared_crawler: Optional[CoupangCrawler] = None
@@ -338,12 +605,44 @@ if __name__ == "__main__":
         default=120,
         help="bootstrap-login 모드에서 로그인 대기 시간(초)",
     )
+    parser.add_argument(
+        "--open-search-ready",
+        action="store_true",
+        help="쿠팡 메인 접속 후 검색창 수동 입력 대기 모드",
+    )
+    parser.add_argument(
+        "--open-google-ready",
+        action="store_true",
+        help="Google 홈 화면만 열어두고 수동 검색 대기 모드",
+    )
+    parser.add_argument(
+        "--parse-url",
+        default="",
+        help="사용자가 전달한 쿠팡 검색결과 URL 파싱 모드",
+    )
+    parser.add_argument(
+        "--open-home-ready",
+        action="store_true",
+        help="쿠팡 홈 접속 확인 후 수동 조작 대기 모드",
+    )
     args = parser.parse_args()
 
     crawler = get_shared_crawler()
     if args.bootstrap_login:
         ok = crawler.bootstrap_login_session(wait_seconds=args.wait_seconds)
         print({"bootstrap_login": bool(ok), "profile_dir": crawler._chrome_user_data_dir, "profile": crawler._chrome_profile})
+    elif args.open_home_ready:
+        ok = crawler.open_home_ready_session(wait_seconds=args.wait_seconds)
+        print({"open_home_ready": bool(ok), "profile_dir": crawler._chrome_user_data_dir, "profile": crawler._chrome_profile})
+    elif args.open_google_ready:
+        ok = crawler.open_google_ready_session(wait_seconds=args.wait_seconds)
+        print({"open_google_ready": bool(ok), "profile_dir": crawler._chrome_user_data_dir, "profile": crawler._chrome_profile})
+    elif args.open_search_ready:
+        ok = crawler.open_search_ready_session(wait_seconds=args.wait_seconds)
+        print({"open_search_ready": bool(ok), "profile_dir": crawler._chrome_user_data_dir, "profile": crawler._chrome_profile})
+    elif args.parse_url:
+        print(crawler.parse_coupang_search_url(args.parse_url))
+        print(crawler.get_stats())
     else:
         print(crawler.crawl_coupang(args.keyword))
         print(crawler.get_stats())
