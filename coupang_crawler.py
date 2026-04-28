@@ -4,8 +4,7 @@ import os
 import random
 import re
 import time
-import os
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/root/.cache/ms-playwright"
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
@@ -87,6 +86,17 @@ class CoupangCrawler:
 
     def _cache_key(self, keyword: str) -> str:
         return f"{keyword.strip()}_{datetime.now().strftime('%Y%m%d')}"
+
+    def _log_playwright_preflight(self) -> None:
+        path = str(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")).strip()
+        if not path:
+            safe_print("[PLAYWRIGHT_CHECK] PLAYWRIGHT_BROWSERS_PATH is not set.")
+            return
+        base = Path(path)
+        bins = list(base.glob("chromium-*/chrome-linux64/chrome")) if base.exists() else []
+        safe_print(
+            f"[PLAYWRIGHT_CHECK] path={path}, exists={base.exists()}, chromium_bin_count={len(bins)}"
+        )
 
     def _parse_int(self, text: str) -> Optional[int]:
         raw = re.sub(r"[^0-9]", "", str(text or ""))
@@ -251,6 +261,7 @@ class CoupangCrawler:
         if self._page is not None:
             return self._page
         try:
+            self._log_playwright_preflight()
             use_headless = self._headless if force_headless is None else bool(force_headless)
             self._playwright = sync_playwright().start()
             self._context = self._playwright.chromium.launch_persistent_context(
