@@ -180,11 +180,11 @@ def run() -> None:
 
     with st.sidebar:
         st.subheader("실행 설정")
-        if st.button("로그아웃", use_container_width=True):
+        if st.button("로그아웃", width='stretch'):
             st.session_state["is_admin_authed"] = False
             st.rerun()
         seeds_text = st.text_input("주제어(쉼표로 구분)", key="seed_input")
-        detect_clicked = st.button("주제어 기반 카테고리 찾기", use_container_width=True)
+        detect_clicked = st.button("주제어 기반 카테고리 찾기", width='stretch')
         if detect_clicked:
             first_seed = str(seeds_text).split(",")[0].strip() if seeds_text else ""
             client_id = str(os.getenv("NAVER_CLIENT_ID", "")).strip() or str(
@@ -209,9 +209,9 @@ def run() -> None:
         start_date = st.date_input("분석 시작일", value=default_start)
         end_date = st.date_input("분석 종료일", value=default_end)
         mode_label = st.selectbox("분석 모드", ["빠른 모드", "정밀 모드"], index=0)
-        run_clicked = st.button("분석 실행", type="primary", use_container_width=True)
+        run_clicked = st.button("분석 실행", type="primary", width='stretch')
 
-        st.divider()
+        st.divider()    
         st.markdown("**환경 확인**")
         has_mysql_url = bool((os.getenv("MYSQL_URL") or "").strip())
         st.write(f"- MYSQL_URL 설정: {'예' if has_mysql_url else '아니오'}")
@@ -258,7 +258,7 @@ def run() -> None:
                 st.warning("결과가 없어 저장되지 않았습니다.")
             if isinstance(last_report_df, pd.DataFrame) and not last_report_df.empty:
                 st.subheader("리포트 미리보기 (템플릿 8열)")
-                st.dataframe(last_report_df, use_container_width=True, hide_index=True)
+                st.dataframe(last_report_df, width='stretch', hide_index=True)
                 ts = datetime.now().strftime("%Y%m%d_%H%M")
                 xlsx = report_to_excel_bytes(last_report_df)
                 st.download_button(
@@ -266,7 +266,7 @@ def run() -> None:
                     data=xlsx,
                     file_name=f"모디바_카테고리별_TOP10_추천분석서_{ts}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    width='stretch',
                     key="dl_analysis_report",
                 )
         else:
@@ -361,11 +361,11 @@ def run() -> None:
             if "판단 밴드" in view_df.columns:
                 st.dataframe(
                     view_df.style.map(_band_style, subset=["판단 밴드"]),
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
             else:
-                st.dataframe(view_df, use_container_width=True, hide_index=True)
+                st.dataframe(view_df, width='stretch', hide_index=True)
 
             insight_cols = [
                 "keyword_text",
@@ -414,7 +414,7 @@ def run() -> None:
                 file_name=f"모디바_시장성점수_조회결과_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_market_score_report",
-                use_container_width=True,
+                width='stretch',
             )
         else:
             st.info("조회 결과가 없습니다.")
@@ -435,7 +435,7 @@ def run() -> None:
             search_clicked = st.button(
                 "Top10 조회",
                 key="coupang_top10_search_btn",
-                use_container_width=True,
+                width='stretch',
             )
 
         if search_clicked:
@@ -463,7 +463,7 @@ def run() -> None:
                 top10_df = top10_df.rename(columns=rename_map)
                 ordered_cols = ["순위", "상품명", "가격(원)", "리뷰수", "평점", "배송비", "상품 URL"]
                 top10_df = top10_df[[c for c in ordered_cols if c in top10_df.columns]]
-                st.dataframe(top10_df, use_container_width=True, hide_index=True)
+                st.dataframe(top10_df, width='stretch', hide_index=True)
         else:
             top10_template = pd.DataFrame(
                 [
@@ -479,7 +479,7 @@ def run() -> None:
                     for rank in range(1, 11)
                 ]
             )
-            st.dataframe(top10_template, use_container_width=True, hide_index=True)
+            st.dataframe(top10_template, width='stretch', hide_index=True)
             if isinstance(result, dict) and result.get("reason_code"):
                 st.warning(f"조회 결과가 없습니다. reason_code={result.get('reason_code')}")
         st.caption("표시 컬럼: 순위, 상품명, 가격, 리뷰수, 평점, 배송비, 상품 URL")
