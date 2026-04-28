@@ -5,7 +5,7 @@ import random
 import re
 import time
 import os
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/root/.cache/ms-playwright"
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/app/.playwright-browsers"
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
@@ -13,6 +13,7 @@ from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import BrowserContext, Error, Page, Playwright, TimeoutError, sync_playwright
+from playwright.sync_api import sync_playwright
 
 # CP949 환경에서도 깨지지 않게 출력하기 위한 유틸 함수
 def safe_print(*args, **kwargs):

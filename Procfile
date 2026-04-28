@@ -1,1 +1,1 @@
-web: playwright install chromium && streamlit run app_web.py --server.port $PORT --server.address 0.0.0.0
+web: web: PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers playwright install chromium && PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers streamlit run app_web.py --server.port $PORT --server.address 0.0.0.0
