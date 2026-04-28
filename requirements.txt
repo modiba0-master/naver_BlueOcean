@@ -1,12 +1,9 @@
-requests
-pandas
-pymysql
-openpyxl
 streamlit
-xlrd
+pandas
+requests
 beautifulsoup4
-selenium
-langgraph
-chromadb
 playwright
 playwright-stealth
+pymysql
+openpyxl
+xlrd
