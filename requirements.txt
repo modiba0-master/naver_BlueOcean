@@ -9,3 +9,4 @@ selenium
 langgraph
 chromadb
 playwright
+playwright-stealth
