@@ -11,9 +11,6 @@ from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import BrowserContext, Error, Page, Playwright, TimeoutError, sync_playwright
-from playwright_stealth import stealth_sync  # [추가됨] 봇 탐지 우회 라이브러리
-
-HEADLESS = True
 
 # CP949 환경에서도 깨지지 않게 출력하기 위한 유틸 함수
 def safe_print(*args, **kwargs):
@@ -22,6 +19,37 @@ def safe_print(*args, **kwargs):
         print(text, **kwargs)
     except UnicodeEncodeError:
         print(text.encode("cp949", errors="ignore").decode("cp949", errors="ignore"), **kwargs)
+
+# [수정] 명칭 불일치 및 임포트 에러 완벽 방어 (Soft Import)
+try:
+    import playwright_stealth
+    STEALTH_AVAILABLE = True
+except ImportError:
+    STEALTH_AVAILABLE = False
+
+def apply_stealth(page: Page):
+    """라이브러리 버전에 상관없이 안전하게 스텔스 적용"""
+    if not STEALTH_AVAILABLE:
+        return
+    try:
+        # 1. stealth_sync 시도
+        if hasattr(playwright_stealth, 'stealth_sync'):
+            playwright_stealth.stealth_sync(page)
+            safe_print("[INFO] stealth_sync applied.")
+        # 2. sync_stealth 시도 (버전에 따라 이름이 다를 수 있음)
+        elif hasattr(playwright_stealth, 'sync_stealth'):
+            playwright_stealth.sync_stealth(page)
+            safe_print("[INFO] sync_stealth applied.")
+        # 3. 범용 stealth 시도 (최신 버전에서 주로 사용됨)
+        elif hasattr(playwright_stealth, 'stealth'):
+            playwright_stealth.stealth(page)
+            safe_print("[INFO] stealth applied.")
+        else:
+            safe_print("[WARN] No known stealth function found in package.")
+    except Exception as e:
+        safe_print(f"[ERROR] Failed to apply stealth: {e}")
+
+HEADLESS = True
 
 
 class CoupangCrawler:
@@ -241,13 +269,16 @@ class CoupangCrawler:
             page = self._context.new_page()
             
             # [USER_CUSTOM_STUFF]
-            stealth_sync(page) # 1. 봇 탐지 지표 위장
+            if STEALTH_AVAILABLE:
+                safe_print("[INFO] Stealth 모드 활성화: 탐지 우회 적용 중...")
+                apply_stealth(page)
+            else:
+                # 라이브러리가 없을 경우 경고 로그만 남기고 일반 실행
+                safe_print("[WARN] playwright_stealth 미설치: 기본 모드로 실행합니다. (차단 위험 높음)")
 
-            # 2. 추가적인 navigator.webdriver 탐지 무력화 스크립트 주입
+            # 공통 스크립트 주입 (라이브러리 없이도 가능한 우회)
             page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                })
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             """)
             
             page.set_default_timeout(15000)
@@ -443,7 +474,8 @@ class CoupangCrawler:
             if self._is_blocked(html, page.title()):
                 safe_print("[WAF_BLOCK] 지정된 URL 파싱 중 WAF 차단 발생.")
                 self._stats["blocked"] += 1
-                return self._result_with_reason("BLOCKED_BY_WAF")
+                reason = "BLOCKED_BY_WAF" if STEALTH_AVAILABLE else "BLOCKED_BY_WAF_STEALTH_MISSING"
+                return self._result_with_reason(reason)
 
             page.wait_for_selector("li.search-product", timeout=10000)
             page.wait_for_timeout(800)
@@ -563,7 +595,8 @@ class CoupangCrawler:
             cached["reason_code"] = "CACHE_FALLBACK"
             return cached
         if self._stats.get("blocked", 0) > 0:
-            return self._result_with_reason("BLOCKED_BY_WAF")
+            reason = "BLOCKED_BY_WAF" if STEALTH_AVAILABLE else "BLOCKED_BY_WAF_STEALTH_MISSING"
+            return self._result_with_reason(reason)
         return self._result_with_reason("CRAWL_FAILED")
 
     def get_stats(self) -> Dict[str, int]:
