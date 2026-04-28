@@ -252,7 +252,7 @@ class CoupangCrawler:
             self._playwright = sync_playwright().start()
             self._context = self._playwright.chromium.launch_persistent_context(
                 user_data_dir=self._chrome_user_data_dir,
-                headless=use_headless,
+                headless=True,
                 viewport={"width": 1440, "height": 2000},
                 locale="ko-KR",
                 user_agent=(
