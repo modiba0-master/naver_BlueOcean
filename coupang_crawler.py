@@ -252,7 +252,6 @@ class CoupangCrawler:
             self._playwright = sync_playwright().start()
             self._context = self._playwright.chromium.launch_persistent_context(
                 user_data_dir=self._chrome_user_data_dir,
-                channel="chrome",
                 headless=use_headless,
                 viewport={"width": 1440, "height": 2000},
                 locale="ko-KR",
@@ -261,6 +260,10 @@ class CoupangCrawler:
                     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 ),
                 args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
                     "--disable-blink-features=AutomationControlled",
                     f"--profile-directory={self._chrome_profile}",
                 ],
