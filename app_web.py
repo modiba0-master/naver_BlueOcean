@@ -421,105 +421,45 @@ def run() -> None:
 
     with tab_coupang:
         st.subheader("쿠팡 상품 키워드 분석")
-        st.caption("시장성 결과 중 쿠팡 Top10 기반 지표(상품수/평균리뷰수/평균가격)를 별도 확인합니다.")
+        st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시하는 전용 영역입니다. (크롤링 연결 전 UI 틀)")
 
-        c_filter_col1, c_filter_col2, c_filter_col3 = st.columns([2, 1, 1])
-        with c_filter_col1:
-            coupang_keyword_like = st.text_input("키워드 필터", value="", key="coupang_keyword_like")
-        with c_filter_col2:
-            coupang_limit = st.selectbox("건수", [20, 50, 100, 200], index=1, key="coupang_limit")
-        with c_filter_col3:
-            coupang_sort = st.selectbox(
-                "정렬",
-                ["판매가치 점수", "2차 최종 점수", "쿠팡 Top10 평균리뷰수", "쿠팡 Top10 평균가격", "분석시각"],
-                index=0,
-                key="coupang_sort",
+        c_input_col1, c_input_col2 = st.columns([3, 1])
+        with c_input_col1:
+            coupang_keyword = st.text_input(
+                "쿠팡 검색 키워드",
+                value="",
+                placeholder="예: 챗지피티",
+                key="coupang_single_keyword",
             )
-
-        c_band_col1, c_band_col2 = st.columns([3, 1])
-        with c_band_col1:
-            coupang_bands = st.multiselect(
-                "판단 밴드",
-                ["GO", "WATCH", "DROP"],
-                default=["GO", "WATCH", "DROP"],
-                key="coupang_bands",
-            )
-        with c_band_col2:
-            coupang_go_only = st.checkbox("GO만 보기", value=False, key="coupang_go_only")
-
-        try:
-            coupang_rows = query_market_score_rows(
-                limit=int(coupang_limit),
-                keyword_like=(coupang_keyword_like or "").strip() or None,
-                started_from=None,
-                started_to=None,
-            )
-        except Exception as e:
-            st.error(f"쿠팡 분석 조회 실패: {e}")
-            coupang_rows = []
-
-        if coupang_rows:
-            coupang_df = pd.DataFrame(coupang_rows)
-            coupang_df = _apply_band_filter(coupang_df, coupang_bands, coupang_go_only)
-            coupang_sort_map = {
-                "판매가치 점수": ("commercial_score", False),
-                "2차 최종 점수": ("final_score", False),
-                "쿠팡 Top10 평균리뷰수": ("top10_avg_reviews", False),
-                "쿠팡 Top10 평균가격": ("top10_avg_price", False),
-                "분석시각": ("started_at", False),
-            }
-            c_sort_col, c_ascending = coupang_sort_map.get(coupang_sort, ("commercial_score", False))
-            if c_sort_col in coupang_df.columns:
-                coupang_df = coupang_df.sort_values(by=c_sort_col, ascending=c_ascending, na_position="last")
-            coupang_cols = [
-                "started_at",
-                "seed_keyword",
-                "keyword_text",
-                "product_count",
-                "top10_avg_reviews",
-                "top10_avg_price",
-                "conversion_score",
-                "commercial_score",
-                "final_score",
-                "decision_band",
-            ]
-            coupang_cols = [c for c in coupang_cols if c in coupang_df.columns]
-            coupang_view_df = coupang_df[coupang_cols].rename(
-                columns={
-                    "started_at": "분석시각",
-                    "seed_keyword": "주제어",
-                    "keyword_text": "키워드",
-                    "product_count": "쿠팡 상품수",
-                    "top10_avg_reviews": "쿠팡 Top10 평균리뷰수",
-                    "top10_avg_price": "쿠팡 Top10 평균가격",
-                    "conversion_score": "전환 점수",
-                    "commercial_score": "판매가치 점수",
-                    "final_score": "2차 최종 점수",
-                    "decision_band": "판단 밴드",
-                }
-            )
-            st.caption("밴드 색상: GO(초록) · WATCH(주황) · DROP(빨강)")
-            if "판단 밴드" in coupang_view_df.columns:
-                st.dataframe(
-                    coupang_view_df.style.map(_band_style, subset=["판단 밴드"]),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.dataframe(coupang_view_df, use_container_width=True, hide_index=True)
-
-            ts = datetime.now().strftime("%Y%m%d_%H%M")
-            xlsx_coupang = report_to_excel_bytes(coupang_view_df)
-            st.download_button(
-                label="엑셀 다운로드 (쿠팡 상품 키워드 분석 결과)",
-                data=xlsx_coupang,
-                file_name=f"모디바_쿠팡_상품키워드_분석결과_{ts}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_coupang_analysis_report",
+        with c_input_col2:
+            search_clicked = st.button(
+                "Top10 조회",
+                key="coupang_top10_search_btn",
                 use_container_width=True,
             )
-        else:
-            st.info("쿠팡 분석 지표 조회 결과가 없습니다.")
+
+        if search_clicked:
+            if not str(coupang_keyword).strip():
+                st.warning("키워드를 입력해주세요.")
+            else:
+                st.info("현재는 크롤링 연결 전 단계입니다. 아래 결과 테이블은 표시용 틀입니다.")
+
+        top10_template = pd.DataFrame(
+            [
+                {
+                    "순위": rank,
+                    "상품명": "",
+                    "가격(원)": None,
+                    "리뷰수": None,
+                    "평점": None,
+                    "배송비": "",
+                    "상품 URL": "",
+                }
+                for rank in range(1, 11)
+            ]
+        )
+        st.dataframe(top10_template, use_container_width=True, hide_index=True)
+        st.caption("표시 컬럼: 순위, 상품명, 가격, 리뷰수, 평점, 배송비, 상품 URL")
 
 
 if __name__ == "__main__":
