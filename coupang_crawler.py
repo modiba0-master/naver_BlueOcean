@@ -11,6 +11,7 @@ from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import BrowserContext, Error, Page, Playwright, TimeoutError, sync_playwright
+from playwright_stealth import stealth_sync  # [추가됨] 봇 탐지 우회 라이브러리
 
 HEADLESS = True
 
@@ -236,7 +237,19 @@ class CoupangCrawler:
                     f"--profile-directory={self._chrome_profile}",
                 ],
             )
+            
             page = self._context.new_page()
+            
+            # [USER_CUSTOM_STUFF]
+            stealth_sync(page) # 1. 봇 탐지 지표 위장
+
+            # 2. 추가적인 navigator.webdriver 탐지 무력화 스크립트 주입
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """)
+            
             page.set_default_timeout(15000)
             self._page = page
             return self._page
