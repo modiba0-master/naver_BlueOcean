@@ -4,7 +4,6 @@ import os
 import random
 import re
 import time
-from playwright_stealth import stealth_sync
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
@@ -238,17 +237,6 @@ class CoupangCrawler:
                 ],
             )
             page = self._context.new_page()
-            page = browser_context.new_page() # 혹은 browser_context.pages[0]
-            stealth_sync(page) # 1. 봇 탐지 지표 위장
-
-# 2. 추가적인 navigator.webdriver 탐지 무력화 스크립트 주입
-            page.add_init_script("""
-              Object.defineProperty(navigator, 'webdriver', {
-                   get: () =>时代 undefined
-              })
-            """)
-            
-            
             page.set_default_timeout(15000)
             self._page = page
             return self._page
