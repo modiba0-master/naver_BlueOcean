@@ -423,6 +423,47 @@ def run() -> None:
         st.subheader("쿠팡 상품 키워드 분석")
         st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시합니다.")
 
+        prep_col1, prep_col2 = st.columns(2)
+        with prep_col1:
+            prep_home_clicked = st.button(
+                "접속 준비 확인(홈)",
+                key="coupang_prep_home_btn",
+                width='stretch',
+            )
+        with prep_col2:
+            prep_search_clicked = st.button(
+                "접속 준비 확인(검색창)",
+                key="coupang_prep_search_btn",
+                width='stretch',
+            )
+
+        if prep_home_clicked:
+            with st.spinner("쿠팡 홈 접속 준비 상태를 확인하는 중입니다..."):
+                ok = tool.coupang_crawler.open_home_ready_session(wait_seconds=10)
+            st.session_state["coupang_prep_status"] = {
+                "mode": "home",
+                "ok": bool(ok),
+                "stats": tool.coupang_crawler.get_stats(),
+            }
+
+        if prep_search_clicked:
+            with st.spinner("쿠팡 검색창 접속 준비 상태를 확인하는 중입니다..."):
+                ok = tool.coupang_crawler.open_search_ready_session(wait_seconds=10)
+            st.session_state["coupang_prep_status"] = {
+                "mode": "search",
+                "ok": bool(ok),
+                "stats": tool.coupang_crawler.get_stats(),
+            }
+
+        prep_status = st.session_state.get("coupang_prep_status")
+        if isinstance(prep_status, dict):
+            mode = prep_status.get("mode", "unknown")
+            if prep_status.get("ok"):
+                st.success(f"접속 준비 확인 성공(mode={mode})")
+            else:
+                st.warning(f"접속 준비 확인 실패(mode={mode})")
+            st.caption(f"prep_stats={prep_status.get('stats', {})}")
+
         c_input_col1, c_input_col2 = st.columns([3, 1])
         with c_input_col1:
             coupang_keyword = st.text_input(
@@ -445,6 +486,7 @@ def run() -> None:
                 with st.spinner("쿠팡 Top10 상품을 조회하는 중입니다..."):
                     crawl_result = tool.coupang_crawler.crawl_coupang(str(coupang_keyword).strip())
                 st.session_state["coupang_last_result"] = crawl_result
+                st.session_state["coupang_last_stats"] = tool.coupang_crawler.get_stats()
 
         result = st.session_state.get("coupang_last_result", {})
         top10_items = result.get("top10_items", []) if isinstance(result, dict) else []
@@ -482,6 +524,8 @@ def run() -> None:
             st.dataframe(top10_template, width='stretch', hide_index=True)
             if isinstance(result, dict) and result.get("reason_code"):
                 st.warning(f"조회 결과가 없습니다. reason_code={result.get('reason_code')}")
+                last_stats = st.session_state.get("coupang_last_stats", {})
+                st.caption(f"crawl_stats={last_stats}")
         st.caption("표시 컬럼: 순위, 상품명, 가격, 리뷰수, 평점, 배송비, 상품 URL")
 
 
