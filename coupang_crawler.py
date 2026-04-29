@@ -1,8 +1,10 @@
 import argparse
+import asyncio
 import atexit
 import os
 import random
 import re
+import sys
 import time
 
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/ms-playwright"
@@ -41,6 +43,16 @@ def apply_stealth(page: Page):
         safe_print(f"[ERROR] Stealth 적용 실패: {str(e)}")
 
 HEADLESS = True
+
+
+def _ensure_windows_proactor_policy() -> None:
+    """Playwright subprocess requires Proactor loop on Windows."""
+    if sys.platform != "win32":
+        return
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        return
 
 class CoupangCrawler:
     """Playwright 기반 쿠팡 검색 Top10 수집기."""
@@ -250,6 +262,7 @@ class CoupangCrawler:
             return self._page
         try:
             self._log_playwright_preflight()
+            _ensure_windows_proactor_policy()
             use_headless = self._headless if force_headless is None else bool(force_headless)
             self._playwright = sync_playwright().start()
             self._context = self._playwright.chromium.launch_persistent_context(
