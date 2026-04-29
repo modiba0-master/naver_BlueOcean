@@ -5,7 +5,7 @@ import random
 import re
 import time
 
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/app/ms-playwright"
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/ms-playwright"
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
