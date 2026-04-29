@@ -24,26 +24,21 @@ def safe_print(*args, **kwargs):
         print(text.encode("cp949", errors="ignore").decode("cp949", errors="ignore"), **kwargs)
 
 # [수정] 명칭 불일치 및 임포트 에러 완벽 방어 (Soft Import)
-try:
-    from playwright_stealth import stealth_sync  # [추가] 함수를 직접 가져옵니다.
-    STEALTH_AVAILABLE = True
-except ImportError:
-    STEALTH_AVAILABLE = False
+import importlib.util
+
+# 라이브러리 존재 여부를 시스템 레벨에서 확실하게 체크
+spec = importlib.util.find_spec("playwright_stealth")
+STEALTH_AVAILABLE = spec is not None
 
 def apply_stealth(page: Page):
-    """라이브러리 버전에 상관없이 안전하게 스텔스 적용"""
     if not STEALTH_AVAILABLE:
-        safe_print("[WARN] Stealth library not found.") # [수정] 로그 문구 정리
         return
-
     try:
-        # 모듈 내의 함수를 직접 찾아서 실행하도록 강제합니다.
-        import playwright_stealth
-        playwright_stealth.stealth_sync(page) 
-        safe_print("[INFO] Stealth(지문 우회) 적용 성공!")
-
+        from playwright_stealth import stealth_sync
+        stealth_sync(page)
+        safe_print("[INFO] Stealth 적용 완료")
     except Exception as e:
-        safe_print(f"[ERROR] Stealth 적용 중 진짜 에러 발생: {str(e)}")
+        safe_print(f"[ERROR] Stealth 적용 실패: {str(e)}")
 
 HEADLESS = True
 
@@ -259,7 +254,7 @@ class CoupangCrawler:
             self._playwright = sync_playwright().start()
             self._context = self._playwright.chromium.launch_persistent_context(
                 user_data_dir=self._chrome_user_data_dir,
-                headless=True,
+                headless=use_headless,
                 channel="chromium",
                 viewport={"width": 1440, "height": 2000},
                 locale="ko-KR",
@@ -281,25 +276,27 @@ class CoupangCrawler:
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars",
+                    "--window-size=1440,2000",
+                    "--start-maximized",
                     f"--profile-directory={self._chrome_profile}",
                 ],
             )
-            
             page = self._context.new_page()
-            
+
             # [USER_CUSTOM_STUFF]
             if STEALTH_AVAILABLE:
                 safe_print("[INFO] Stealth 모드 활성화: 탐지 우회 적용 중...")
                 apply_stealth(page)
             else:
-                # 라이브러리가 없을 경우 경고 로그만 남기고 일반 실행
                 safe_print("[WARN] playwright_stealth 미설치: 기본 모드로 실행합니다. (차단 위험 높음)")
 
             # 공통 스크립트 주입 (라이브러리 없이도 가능한 우회)
-            page.add_init_script("""
+            page.add_init_script(
+                """
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            """)
-            
+                """
+            )
             page.set_default_timeout(15000)
             self._page = page
             return self._page
