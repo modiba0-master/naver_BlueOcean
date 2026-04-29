@@ -453,6 +453,7 @@ def run() -> None:
                 "mode": "home",
                 "ok": bool(ok),
                 "stats": tool.coupang_crawler.get_stats(),
+                "last_error": tool.coupang_crawler.get_last_error(),
             }
 
         if prep_search_clicked:
@@ -462,6 +463,7 @@ def run() -> None:
                 "mode": "search",
                 "ok": bool(ok),
                 "stats": tool.coupang_crawler.get_stats(),
+                "last_error": tool.coupang_crawler.get_last_error(),
             }
 
         prep_status = st.session_state.get("coupang_prep_status")
@@ -472,6 +474,8 @@ def run() -> None:
             else:
                 st.warning(f"접속 준비 확인 실패(mode={mode})")
             st.caption(f"prep_stats={prep_status.get('stats', {})}")
+            if prep_status.get("last_error"):
+                st.error(f"prep_last_error={prep_status.get('last_error')}")
 
         c_input_col1, c_input_col2 = st.columns([3, 1])
         with c_input_col1:
@@ -496,6 +500,7 @@ def run() -> None:
                     crawl_result = tool.coupang_crawler.crawl_coupang(str(coupang_keyword).strip())
                 st.session_state["coupang_last_result"] = crawl_result
                 st.session_state["coupang_last_stats"] = tool.coupang_crawler.get_stats()
+                st.session_state["coupang_last_error"] = tool.coupang_crawler.get_last_error()
 
         result = st.session_state.get("coupang_last_result", {})
         top10_items = result.get("top10_items", []) if isinstance(result, dict) else []
@@ -535,6 +540,9 @@ def run() -> None:
                 st.warning(f"조회 결과가 없습니다. reason_code={result.get('reason_code')}")
                 last_stats = st.session_state.get("coupang_last_stats", {})
                 st.caption(f"crawl_stats={last_stats}")
+                last_error = st.session_state.get("coupang_last_error", {})
+                if last_error:
+                    st.error(f"crawl_last_error={last_error}")
         st.caption("표시 컬럼: 순위, 상품명, 가격, 리뷰수, 평점, 배송비, 상품 URL")
 
 

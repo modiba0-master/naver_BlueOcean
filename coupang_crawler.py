@@ -61,6 +61,7 @@ class CoupangCrawler:
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._last_success_cache: Dict[str, Dict[str, Any]] = {}
         self._stats = {"cache_hit": 0, "requests_ok": 0, "playwright_ok": 0, "failed": 0, "blocked": 0}
+        self._last_error: Dict[str, str] = {}
         self._last_fetch_source = "unknown"
         self._playwright: Optional[Playwright] = None
         self._context: Optional[BrowserContext] = None
@@ -312,9 +313,21 @@ class CoupangCrawler:
             )
             page.set_default_timeout(15000)
             self._page = page
+            self._last_error = {}
             return self._page
         except Error as e:
             safe_print(f"[Crawler Error] keyword=PLAYWRIGHT_INIT, error={e}")
+            self._last_error = {
+                "code": "PLAYWRIGHT_INIT_FAILED",
+                "message": str(e),
+            }
+            return None
+        except Exception as e:
+            safe_print(f"[Crawler Error] keyword=PLAYWRIGHT_INIT_UNEXPECTED, error={e!r}")
+            self._last_error = {
+                "code": "PLAYWRIGHT_INIT_UNEXPECTED",
+                "message": repr(e),
+            }
             return None
 
     def open_home_ready_session(self, wait_seconds: int = 120) -> bool:
@@ -630,6 +643,9 @@ class CoupangCrawler:
 
     def get_stats(self) -> Dict[str, int]:
         return dict(self._stats)
+
+    def get_last_error(self) -> Dict[str, str]:
+        return dict(self._last_error)
 
     def close(self) -> None:
         if self._page is not None:
