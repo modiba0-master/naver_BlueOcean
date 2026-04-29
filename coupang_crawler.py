@@ -14,7 +14,6 @@ from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import BrowserContext, Error, Page, Playwright, TimeoutError, sync_playwright
-from playwright.sync_api import sync_playwright
 
 # CP949 환경에서도 깨지지 않게 출력하기 위한 유틸 함수
 def safe_print(*args, **kwargs):
@@ -26,7 +25,7 @@ def safe_print(*args, **kwargs):
 
 # [수정] 명칭 불일치 및 임포트 에러 완벽 방어 (Soft Import)
 try:
-    import playwright_stealth
+    from playwright_stealth import stealth_sync  # [추가] 함수를 직접 가져옵니다.
     STEALTH_AVAILABLE = True
 except ImportError:
     STEALTH_AVAILABLE = False
@@ -34,24 +33,15 @@ except ImportError:
 def apply_stealth(page: Page):
     """라이브러리 버전에 상관없이 안전하게 스텔스 적용"""
     if not STEALTH_AVAILABLE:
+        safe_print("[WARN] Stealth library not found.") # [수정] 로그 문구 정리
         return
+
     try:
-        # 1. stealth_sync 시도
-        if hasattr(playwright_stealth, 'stealth_sync'):
-            playwright_stealth.stealth_sync(page)
-            safe_print("[INFO] stealth_sync applied.")
-        # 2. sync_stealth 시도 (버전에 따라 이름이 다를 수 있음)
-        elif hasattr(playwright_stealth, 'sync_stealth'):
-            playwright_stealth.sync_stealth(page)
-            safe_print("[INFO] sync_stealth applied.")
-        # 3. 범용 stealth 시도 (최신 버전에서 주로 사용됨)
-        elif hasattr(playwright_stealth, 'stealth'):
-            playwright_stealth.stealth(page)
-            safe_print("[INFO] stealth applied.")
-        else:
-            safe_print("[WARN] No known stealth function found in package.")
+        stealth_sync(page) 
+        safe_print("[INFO] Stealth 모드 활성화 완료.")
+
     except Exception as e:
-        safe_print(f"[ERROR] Failed to apply stealth: {e}")
+        safe_print(f"[ERROR] Stealth 적용 실패 (쿠팡 차단 위험): {str(e)}")
 
 HEADLESS = True
 
@@ -276,6 +266,14 @@ class CoupangCrawler:
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 ),
+                extra_http_headers={
+                    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "Referer": "https://www.google.com/"
+                },
                 args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
