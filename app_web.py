@@ -1,4 +1,6 @@
+import asyncio
 import os
+import sys
 from collections import Counter
 from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
@@ -6,6 +8,13 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import requests
 import streamlit as st
+
+
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 
 from blue_ocean_tool import BlueOceanTool
 from db import query_market_score_rows
