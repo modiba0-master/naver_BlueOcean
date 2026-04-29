@@ -37,14 +37,15 @@ def apply_stealth(page: Page):
         return
 
     try:
-        stealth_sync(page) 
-        safe_print("[INFO] Stealth 모드 활성화 완료.")
+        # 모듈 내의 함수를 직접 찾아서 실행하도록 강제합니다.
+        import playwright_stealth
+        playwright_stealth.stealth_sync(page) 
+        safe_print("[INFO] Stealth(지문 우회) 적용 성공!")
 
     except Exception as e:
-        safe_print(f"[ERROR] Stealth 적용 실패 (쿠팡 차단 위험): {str(e)}")
+        safe_print(f"[ERROR] Stealth 적용 중 진짜 에러 발생: {str(e)}")
 
 HEADLESS = True
-
 
 class CoupangCrawler:
     """Playwright 기반 쿠팡 검색 Top10 수집기."""
