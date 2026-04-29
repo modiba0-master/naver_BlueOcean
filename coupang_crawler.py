@@ -4,6 +4,8 @@ import os
 import random
 import re
 import time
+
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/root/.cache/ms-playwright"
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
