@@ -9,7 +9,10 @@ import threading
 import queue
 import socket
 from collections import Counter
-from tkinter import messagebox
+try:
+    from tkinter import messagebox
+except Exception:
+    messagebox = None
 import hmac
 import hashlib
 import base64
@@ -1161,15 +1164,18 @@ class BlueOceanToolGUI:
         end_date = self.end_date_entry.get().strip()
 
         if not seeds_text:
-            messagebox.showerror("입력 오류", "주제어(시드 키워드)를 입력해주세요.")
+            if messagebox is not None:
+                messagebox.showerror("입력 오류", "주제어(시드 키워드)를 입력해주세요.")
             return
         if not start_date or not end_date:
-            messagebox.showerror("입력 오류", "시작일/종료일을 입력해주세요.")
+            if messagebox is not None:
+                messagebox.showerror("입력 오류", "시작일/종료일을 입력해주세요.")
             return
 
         seeds = [s.strip() for s in seeds_text.split(",") if s.strip()]
         if not seeds:
-            messagebox.showerror("입력 오류", "주제어(시드 키워드)가 비어 있습니다.")
+            if messagebox is not None:
+                messagebox.showerror("입력 오류", "주제어(시드 키워드)가 비어 있습니다.")
             return
 
         # 날짜 형식은 worker에서 검증(에러는 로그로 보이게 처리)
