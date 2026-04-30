@@ -5,6 +5,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 
 from pathlib import Path
@@ -105,6 +106,7 @@ class CoupangCrawler:
         self._playwright: Optional[Playwright] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._io_lock = threading.RLock()
         env_raw = str(os.environ.get("COUPANG_HEADLESS", "")).strip().lower()
         if env_raw in {"0", "false", "n", "no"}:
             self._headless = False
@@ -118,7 +120,7 @@ class CoupangCrawler:
         if not self._chrome_user_data_dir:
             self._chrome_user_data_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
-                ".coupang_chrome_profile",
+                ".coupang_chrome_profile_crawl",
             )
         os.makedirs(self._chrome_user_data_dir, exist_ok=True)
         # 수동 준비(홈/로그인/검색 대기)와 자동 크롤이 프로필 락을 나누지 않도록 분리
@@ -167,6 +169,13 @@ class CoupangCrawler:
 
     def _cache_key(self, keyword: str) -> str:
         return f"{keyword.strip()}_{datetime.now().strftime('%Y%m%d')}"
+
+    def _fallback_profile_dir(self, prep_profile: bool) -> str:
+        suffix = "prep" if prep_profile else "crawl"
+        return os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f".coupang_chrome_profile_{suffix}_fallback_{os.getpid()}_{int(time.time() * 1000)}",
+        )
 
     def _log_playwright_preflight(self) -> None:
         path = str(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")).strip()
@@ -352,43 +361,56 @@ class CoupangCrawler:
             self._log_playwright_preflight()
             _ensure_windows_proactor_policy()
             use_headless = self._headless if force_headless is None else bool(force_headless)
-            user_data_dir = self._prep_user_data_dir if prep_profile else self._chrome_user_data_dir
+            primary_user_data_dir = self._prep_user_data_dir if prep_profile else self._chrome_user_data_dir
+            user_data_dirs = [primary_user_data_dir, self._fallback_profile_dir(prep_profile)]
             self._playwright = sync_playwright().start()
             # --- launch_persistent_context 의 channel (브라우저 바이너리 선택) ---
             # 미설정(None): playwright install 로 받은 번들 Chromium — 서버·Docker·CI에 시스템 Chrome이 없어도 동일 동작.
             # 설정 시: OS에 깔린 브라우저를 씀. 예) chrome, msedge (Playwright 문서의 channel 값과 동일).
             # 기본을 번들로 둔 이유: 환경마다 설치 유무·버전이 달라져 오차가 나기 쉽기 때문. 필요할 때만 env로 전환.
             _channel = str(os.environ.get("COUPANG_PLAYWRIGHT_CHANNEL", "")).strip() or None
-            self._context = self._playwright.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                headless=use_headless,
-                channel=_channel,
-                viewport={"width": 1440, "height": 2000},
-                locale="ko-KR",
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-                extra_http_headers={
-                    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
-                    "Referer": "https://www.google.com/"
-                },
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-infobars",
-                    "--window-size=1440,2000",
-                    "--start-maximized",
-                    f"--profile-directory={self._chrome_profile}",
-                ],
-            )
+            last_error: Optional[Exception] = None
+            for idx, user_data_dir in enumerate(user_data_dirs):
+                try:
+                    self._context = self._playwright.chromium.launch_persistent_context(
+                        user_data_dir=user_data_dir,
+                        headless=use_headless,
+                        channel=_channel,
+                        viewport={"width": 1440, "height": 2000},
+                        locale="ko-KR",
+                        user_agent=(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                        ),
+                        extra_http_headers={
+                            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                            "sec-ch-ua-mobile": "?0",
+                            "sec-ch-ua-platform": '"Windows"',
+                            "Referer": "https://www.google.com/"
+                        },
+                        args=[
+                            "--no-sandbox",
+                            "--disable-setuid-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--disable-gpu",
+                            "--disable-blink-features=AutomationControlled",
+                            "--disable-infobars",
+                            "--window-size=1440,2000",
+                            "--start-maximized",
+                            f"--profile-directory={self._chrome_profile}",
+                        ],
+                    )
+                    break
+                except Error as e:
+                    last_error = e
+                    if idx == 0 and ("ProcessSingleton" in str(e) or "profile is already in use" in str(e)):
+                        safe_print("[WARN] profile in use 감지 — fallback 프로필로 재시도합니다.")
+                        continue
+                    raise
+            if self._context is None and last_error is not None:
+                raise last_error
             page = self._context.new_page()
 
             # [USER_CUSTOM_STUFF]
@@ -429,28 +451,29 @@ class CoupangCrawler:
             return None
 
     def open_home_ready_session(self, wait_seconds: int = 120) -> bool:
-        if self._page is not None:
-            self.close()
-        page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
-        if page is None:
-            return False
-        try:
-            page.goto("https://www.coupang.com", wait_until="domcontentloaded")
-            if self._is_blocked(page.content(), page.title()):
-                safe_print("[WAF_BLOCK] 쿠팡 접속이 차단되었습니다. (Access Denied/CAPTCHA)")
-                self._stats["blocked"] += 1
+        with self._io_lock:
+            if self._page is not None:
+                self.close()
+            page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
+            if page is None:
                 return False
-            page.wait_for_selector("input[name='q'], input[placeholder*='검색']", timeout=15000)
-            safe_print("[Ready] 쿠팡 홈 접속 완료. 검색창 입력 가능 상태입니다.")
-            safe_print("[Ready] 이 창에서 직접 키워드를 입력해 주세요.")
-            safe_print(f"[Ready] 대기시간: {wait_seconds}초")
-            time.sleep(max(10, int(wait_seconds)))
-            return True
-        except Exception as e:
-            safe_print(f"[Crawler Error] keyword=OPEN_HOME_READY, error={e!r}")
-            return False
-        finally:
-            self.close()
+            try:
+                page.goto("https://www.coupang.com", wait_until="domcontentloaded")
+                if self._is_blocked(page.content(), page.title()):
+                    safe_print("[WAF_BLOCK] 쿠팡 접속이 차단되었습니다. (Access Denied/CAPTCHA)")
+                    self._stats["blocked"] += 1
+                    return False
+                page.wait_for_selector("input[name='q'], input[placeholder*='검색']", timeout=15000)
+                safe_print("[Ready] 쿠팡 홈 접속 완료. 검색창 입력 가능 상태입니다.")
+                safe_print("[Ready] 이 창에서 직접 키워드를 입력해 주세요.")
+                safe_print(f"[Ready] 대기시간: {wait_seconds}초")
+                time.sleep(max(10, int(wait_seconds)))
+                return True
+            except Exception as e:
+                safe_print(f"[Crawler Error] keyword=OPEN_HOME_READY, error={e!r}")
+                return False
+            finally:
+                self.close()
 
     def _simulate_human_actions(self, page: Page) -> None:
         try:
@@ -533,70 +556,73 @@ class CoupangCrawler:
             return None
 
     def bootstrap_login_session(self, wait_seconds: int = 120) -> bool:
-        if self._page is not None:
-            self.close()
-        page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
-        if page is None:
-            return False
-        try:
-            page.goto("https://www.coupang.com/np/coupanglogin/login", wait_until="domcontentloaded")
-            safe_print("[Bootstrap] 쿠팡 로그인 페이지를 열었습니다.")
-            safe_print(f"[Bootstrap] 아래 경로에 세션이 저장됩니다: {self._chrome_user_data_dir}")
-            safe_print(f"[Bootstrap] {wait_seconds}초 내 수동 로그인 후 창을 그대로 두세요.")
-            time.sleep(max(10, int(wait_seconds)))
-            safe_print("[Bootstrap] 세션 저장 절차를 종료합니다.")
-            return True
-        except Exception as e:
-            safe_print(f"[Crawler Error] keyword=BOOTSTRAP_LOGIN, error={e!r}")
-            return False
-        finally:
-            self.close()
+        with self._io_lock:
+            if self._page is not None:
+                self.close()
+            page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
+            if page is None:
+                return False
+            try:
+                page.goto("https://www.coupang.com/np/coupanglogin/login", wait_until="domcontentloaded")
+                safe_print("[Bootstrap] 쿠팡 로그인 페이지를 열었습니다.")
+                safe_print(f"[Bootstrap] 아래 경로에 세션이 저장됩니다: {self._prep_user_data_dir}")
+                safe_print(f"[Bootstrap] {wait_seconds}초 내 수동 로그인 후 창을 그대로 두세요.")
+                time.sleep(max(10, int(wait_seconds)))
+                safe_print("[Bootstrap] 세션 저장 절차를 종료합니다.")
+                return True
+            except Exception as e:
+                safe_print(f"[Crawler Error] keyword=BOOTSTRAP_LOGIN, error={e!r}")
+                return False
+            finally:
+                self.close()
 
     def open_search_ready_session(self, wait_seconds: int = 120) -> bool:
-        if self._page is not None:
-            self.close()
-        page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
-        if page is None:
-            return False
-        try:
-            page.goto("https://www.coupang.com", wait_until="domcontentloaded")
-            if self._is_blocked(page.content(), page.title()):
-                safe_print("[WAF_BLOCK] 쿠팡 접속이 차단되었습니다. (Access Denied/CAPTCHA)")
-                self._stats["blocked"] += 1
+        with self._io_lock:
+            if self._page is not None:
+                self.close()
+            page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
+            if page is None:
                 return False
-            page.wait_for_selector("input[name='q'], input[placeholder*='검색']", timeout=15000)
-            self._simulate_human_actions(page)
-            safe_print("[Ready] 쿠팡 메인 페이지 접속 완료.")
-            safe_print("[Ready] 검색창에 키워드를 직접 입력해 주세요.")
-            safe_print(f"[Ready] {wait_seconds}초 동안 브라우저를 유지합니다.")
-            time.sleep(max(10, int(wait_seconds)))
-            safe_print("[Ready] 수동 입력 대기 모드를 종료합니다.")
-            return True
-        except Exception as e:
-            safe_print(f"[Crawler Error] keyword=OPEN_SEARCH_READY, error={e!r}")
-            return False
-        finally:
-            self.close()
+            try:
+                page.goto("https://www.coupang.com", wait_until="domcontentloaded")
+                if self._is_blocked(page.content(), page.title()):
+                    safe_print("[WAF_BLOCK] 쿠팡 접속이 차단되었습니다. (Access Denied/CAPTCHA)")
+                    self._stats["blocked"] += 1
+                    return False
+                page.wait_for_selector("input[name='q'], input[placeholder*='검색']", timeout=15000)
+                self._simulate_human_actions(page)
+                safe_print("[Ready] 쿠팡 메인 페이지 접속 완료.")
+                safe_print("[Ready] 검색창에 키워드를 직접 입력해 주세요.")
+                safe_print(f"[Ready] {wait_seconds}초 동안 브라우저를 유지합니다.")
+                time.sleep(max(10, int(wait_seconds)))
+                safe_print("[Ready] 수동 입력 대기 모드를 종료합니다.")
+                return True
+            except Exception as e:
+                safe_print(f"[Crawler Error] keyword=OPEN_SEARCH_READY, error={e!r}")
+                return False
+            finally:
+                self.close()
 
     def open_google_ready_session(self, wait_seconds: int = 180) -> bool:
-        if self._page is not None:
-            self.close()
-        page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
-        if page is None:
-            return False
-        try:
-            page.goto("https://www.google.com/ncr", wait_until="domcontentloaded")
-            page.wait_for_selector("textarea[name='q'], input[name='q']:not([type='hidden'])", timeout=15000)
-            safe_print("[Ready] Google 홈 화면이 열렸습니다.")
-            safe_print("[Ready] 직접 검색 후 쿠팡 결과 페이지 URL을 복사해 전달해 주세요.")
-            safe_print(f"[Ready] {wait_seconds}초 동안 브라우저를 유지합니다.")
-            time.sleep(max(10, int(wait_seconds)))
-            return True
-        except Exception as e:
-            safe_print(f"[Crawler Error] keyword=OPEN_GOOGLE_READY, error={e!r}")
-            return False
-        finally:
-            self.close()
+        with self._io_lock:
+            if self._page is not None:
+                self.close()
+            page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
+            if page is None:
+                return False
+            try:
+                page.goto("https://www.google.com/ncr", wait_until="domcontentloaded")
+                page.wait_for_selector("textarea[name='q'], input[name='q']:not([type='hidden'])", timeout=15000)
+                safe_print("[Ready] Google 홈 화면이 열렸습니다.")
+                safe_print("[Ready] 직접 검색 후 쿠팡 결과 페이지 URL을 복사해 전달해 주세요.")
+                safe_print(f"[Ready] {wait_seconds}초 동안 브라우저를 유지합니다.")
+                time.sleep(max(10, int(wait_seconds)))
+                return True
+            except Exception as e:
+                safe_print(f"[Crawler Error] keyword=OPEN_GOOGLE_READY, error={e!r}")
+                return False
+            finally:
+                self.close()
 
     def parse_coupang_search_url(self, search_url: str) -> Dict[str, Any]:
         url = str(search_url or "").strip()
@@ -605,34 +631,35 @@ class CoupangCrawler:
         if "coupang.com/np/search" not in url:
             return self._result_with_reason("INVALID_URL")
 
-        page = self._get_page(force_headless=True)
-        if page is None:
-            return self._result_with_reason("PLAYWRIGHT_INIT_FAILED")
-        try:
-            page.goto(url, wait_until="domcontentloaded")
-            html = page.content()
-            if self._is_blocked(html, page.title()):
-                safe_print("[WAF_BLOCK] 지정된 URL 파싱 중 WAF 차단 발생.")
-                self._stats["blocked"] += 1
-                reason = "BLOCKED_BY_WAF" if STEALTH_AVAILABLE else "BLOCKED_BY_WAF_NO_STEALTH"
-                return self._result_with_reason(reason)
+        with self._io_lock:
+            page = self._get_page(force_headless=True)
+            if page is None:
+                return self._result_with_reason("PLAYWRIGHT_INIT_FAILED")
+            try:
+                page.goto(url, wait_until="domcontentloaded")
+                html = page.content()
+                if self._is_blocked(html, page.title()):
+                    safe_print("[WAF_BLOCK] 지정된 URL 파싱 중 WAF 차단 발생.")
+                    self._stats["blocked"] += 1
+                    reason = "BLOCKED_BY_WAF" if STEALTH_AVAILABLE else "BLOCKED_BY_WAF_NO_STEALTH"
+                    return self._result_with_reason(reason)
 
-            page.wait_for_selector(_PRODUCT_LIST_SELECTOR, timeout=10000)
-            page.wait_for_timeout(800)
-            html = page.content()
-            product_count, items = self._parse_top10_from_html(html)
-            if product_count <= 0:
-                return self._result_with_reason("NO_PRODUCTS")
-            out = self._build_result(product_count, items)
-            out["reason_code"] = "OK"
-            return out
-        except TimeoutError:
-            return self._result_with_reason("TIMEOUT")
-        except Exception as e:
-            safe_print(f"[Crawler Error] keyword=PARSE_URL, error={e!r}")
-            return self._result_with_reason("PARSE_FAILED")
-        finally:
-            self.close()
+                page.wait_for_selector(_PRODUCT_LIST_SELECTOR, timeout=10000)
+                page.wait_for_timeout(800)
+                html = page.content()
+                product_count, items = self._parse_top10_from_html(html)
+                if product_count <= 0:
+                    return self._result_with_reason("NO_PRODUCTS")
+                out = self._build_result(product_count, items)
+                out["reason_code"] = "OK"
+                return out
+            except TimeoutError:
+                return self._result_with_reason("TIMEOUT")
+            except Exception as e:
+                safe_print(f"[Crawler Error] keyword=PARSE_URL, error={e!r}")
+                return self._result_with_reason("PARSE_FAILED")
+            finally:
+                self.close()
 
     def parse_local_html(self, file_path: str) -> Dict[str, Any]:
         """직접 저장한 로컬 HTML 파일 파싱 기능"""
@@ -659,63 +686,64 @@ class CoupangCrawler:
             return self._result_with_reason("PARSE_FAILED")
 
     def _crawl_with_playwright(self, keyword: str) -> Optional[Dict[str, Any]]:
-        page = self._get_page()
-        if page is None:
-            return None
-        try:
-            url = self._build_search_url(keyword)
-            page.goto(url, wait_until="domcontentloaded")
-            if self._is_blocked(page.content(), page.title()):
-                safe_print("[WAF_BLOCK][playwright] initial load blocked by WAF/CAPTCHA")
-                self._stats["blocked"] += 1
-                return None
-            self._simulate_human_actions(page)
-
-            req_result = self._requests_with_browser_session(page, url)
-            if req_result is not None:
-                return req_result
-
-            page.wait_for_selector(_PRODUCT_LIST_SELECTOR, timeout=12000)
-            page.wait_for_timeout(random.randint(900, 1600))
-            safe_print(
-                f"[Crawler][playwright] ready keyword={keyword} "
-                f"title={page.title()[:80]} url={page.url}"
-            )
-            html = page.content()
-            if self._is_blocked(html, page.title()):
-                safe_print("[WAF_BLOCK][playwright] blocked signal detected before parsing")
-                self._stats["blocked"] += 1
-                return None
-            product_count, items = self._parse_top10_from_html(html)
-            safe_print(
-                f"[Crawler][playwright] parsed keyword={keyword} "
-                f"product_count={product_count} top10_items={len(items)}"
-            )
-            if product_count <= 0:
-                return None
-            self._last_fetch_source = "playwright"
-            return self._build_result(product_count, items)
-        except TimeoutError as e:
-            safe_print(f"[Crawler Error] keyword={keyword}, error=timeout, detail={e}")
-            return None
-        except Exception as e:
-            err_name = type(e).__name__
-            if err_name == "TargetClosedError" or "TargetClosed" in err_name:
-                safe_print(f"[Crawler Error] keyword={keyword}, browser/context closed: {e!r}")
-                self._last_error = {"code": "BROWSER_CLOSED", "message": str(e)}
-                try:
-                    self.close()
-                except Exception:
-                    pass
+        with self._io_lock:
+            page = self._get_page()
+            if page is None:
                 return None
             try:
-                cur = page.url if page else "N/A"
-                title = (page.title() if page else "N/A") or "N/A"
-            except Exception:
-                cur = "N/A"
-                title = "N/A"
-            safe_print(f"[Crawler Error] keyword={keyword}, current_url={cur}, title={title}, error={e!r}")
-            return None
+                url = self._build_search_url(keyword)
+                page.goto(url, wait_until="domcontentloaded")
+                if self._is_blocked(page.content(), page.title()):
+                    safe_print("[WAF_BLOCK][playwright] initial load blocked by WAF/CAPTCHA")
+                    self._stats["blocked"] += 1
+                    return None
+                self._simulate_human_actions(page)
+
+                req_result = self._requests_with_browser_session(page, url)
+                if req_result is not None:
+                    return req_result
+
+                page.wait_for_selector(_PRODUCT_LIST_SELECTOR, timeout=12000)
+                page.wait_for_timeout(random.randint(900, 1600))
+                safe_print(
+                    f"[Crawler][playwright] ready keyword={keyword} "
+                    f"title={page.title()[:80]} url={page.url}"
+                )
+                html = page.content()
+                if self._is_blocked(html, page.title()):
+                    safe_print("[WAF_BLOCK][playwright] blocked signal detected before parsing")
+                    self._stats["blocked"] += 1
+                    return None
+                product_count, items = self._parse_top10_from_html(html)
+                safe_print(
+                    f"[Crawler][playwright] parsed keyword={keyword} "
+                    f"product_count={product_count} top10_items={len(items)}"
+                )
+                if product_count <= 0:
+                    return None
+                self._last_fetch_source = "playwright"
+                return self._build_result(product_count, items)
+            except TimeoutError as e:
+                safe_print(f"[Crawler Error] keyword={keyword}, error=timeout, detail={e}")
+                return None
+            except Exception as e:
+                err_name = type(e).__name__
+                if err_name == "TargetClosedError" or "TargetClosed" in err_name:
+                    safe_print(f"[Crawler Error] keyword={keyword}, browser/context closed: {e!r}")
+                    self._last_error = {"code": "BROWSER_CLOSED", "message": str(e)}
+                    try:
+                        self.close()
+                    except Exception:
+                        pass
+                    return None
+                try:
+                    cur = page.url if page else "N/A"
+                    title = (page.title() if page else "N/A") or "N/A"
+                except Exception:
+                    cur = "N/A"
+                    title = "N/A"
+                safe_print(f"[Crawler Error] keyword={keyword}, current_url={cur}, title={title}, error={e!r}")
+                return None
 
     def crawl_coupang(self, keyword: str) -> Dict[str, Any]:
         kw = str(keyword or "").strip()
@@ -755,24 +783,25 @@ class CoupangCrawler:
         return dict(self._last_error)
 
     def close(self) -> None:
-        if self._page is not None:
-            try:
-                self._page.close()
-            except Exception:
-                pass
-            self._page = None
-        if self._context is not None:
-            try:
-                self._context.close()
-            except Exception:
-                pass
-            self._context = None
-        if self._playwright is not None:
-            try:
-                self._playwright.stop()
-            except Exception:
-                pass
-            self._playwright = None
+        with self._io_lock:
+            if self._page is not None:
+                try:
+                    self._page.close()
+                except Exception:
+                    pass
+                self._page = None
+            if self._context is not None:
+                try:
+                    self._context.close()
+                except Exception:
+                    pass
+                self._context = None
+            if self._playwright is not None:
+                try:
+                    self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
 
 
 _shared_crawler: Optional[CoupangCrawler] = None
