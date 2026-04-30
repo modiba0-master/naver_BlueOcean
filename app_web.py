@@ -1,6 +1,8 @@
 import asyncio
 import os
+import subprocess
 import sys
+import webbrowser
 from collections import Counter
 from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
@@ -19,6 +21,56 @@ if sys.platform == "win32":
 from blue_ocean_tool import BlueOceanTool
 from db import query_market_score_rows
 from report_format import report_to_excel_bytes
+
+_GOOGLE_HOME_URL = "https://www.google.com/"
+
+
+def _chrome_exe_candidates_windows() -> List[str]:
+    pf = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    pfx86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+    local = os.environ.get("LOCALAPPDATA", "")
+    return [
+        os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(pfx86, "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+    ]
+
+
+def open_google_home_in_desktop_browser() -> bool:
+    """로컬에서 Chrome(있으면) 또는 기본 브라우저로 구글 홈만 연다. 서버 헤드리스에서는 실패할 수 있다."""
+    url = _GOOGLE_HOME_URL
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        for exe in _chrome_exe_candidates_windows():
+            if exe and os.path.isfile(exe):
+                try:
+                    subprocess.Popen(
+                        [exe, url],
+                        close_fds=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=flags,
+                    )
+                    return True
+                except OSError:
+                    continue
+        try:
+            subprocess.Popen(
+                ["chrome", url],
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+            )
+            return True
+        except OSError:
+            pass
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
 
 
 def _inject_tab_style() -> None:
@@ -431,6 +483,10 @@ def run() -> None:
     with tab_coupang:
         st.subheader("쿠팡 상품 키워드 분석")
         st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시합니다.")
+        st.caption(
+            "**접속 준비 확인(홈)** 은 앱에서 쿠팡을 열지 않고, 이 PC의 Chrome(가능 시) 또는 기본 브라우저로 "
+            "구글 검색 화면만 엽니다. (Railway 등 서버에서는 브라우저 창을 띄울 수 없을 수 있습니다.)"
+        )
 
         prep_col1, prep_col2 = st.columns(2)
         with prep_col1:
@@ -447,13 +503,15 @@ def run() -> None:
             )
 
         if prep_home_clicked:
-            with st.spinner("쿠팡 홈 접속 준비 상태를 확인하는 중입니다..."):
-                ok = tool.coupang_crawler.open_home_ready_session(wait_seconds=10)
+            with st.spinner("브라우저에서 구글 검색 화면을 여는 중입니다..."):
+                ok = open_google_home_in_desktop_browser()
             st.session_state["coupang_prep_status"] = {
-                "mode": "home",
+                "mode": "home_google",
                 "ok": bool(ok),
-                "stats": tool.coupang_crawler.get_stats(),
-                "last_error": tool.coupang_crawler.get_last_error(),
+                "stats": {},
+                "last_error": {}
+                if ok
+                else {"message": "브라우저를 열 수 없습니다. 로컬 PC에서 실행했는지 확인해 주세요."},
             }
 
         if prep_search_clicked:
