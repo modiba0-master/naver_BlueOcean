@@ -7,7 +7,6 @@ import re
 import sys
 import time
 
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/ms-playwright"
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -25,22 +24,62 @@ def safe_print(*args, **kwargs):
     except UnicodeEncodeError:
         print(text.encode("cp949", errors="ignore").decode("cp949", errors="ignore"), **kwargs)
 
-# [수정] 명칭 불일치 및 임포트 에러 완벽 방어 (Soft Import)
+# --- playwright-stealth (탐지 완화 스크립트 주입) ---
+# PyPI 패키지 "playwright-stealth" 2.x(Mattwmaster58): 동기 경로는 stealth_sync가 아니라
+#   Stealth 인스턴스의 apply_stealth_sync(page) 가 공식 API다.
+# 구버전 1.x 일부: stealth_sync(page) 단일 함수만 제공하는 배포가 있다.
+# 따라서 v2 Stealth를 먼저 시도하고, 없을 때만 stealth_sync 로 폴백한다.
+# STEALTH_AVAILABLE 은 둘 중 실제 호출 가능한 경로가 있으면 True (차단 reason 분기 등에 사용).
 import importlib.util
 
-# 라이브러리 존재 여부를 시스템 레벨에서 확실하게 체크
-spec = importlib.util.find_spec("playwright_stealth")
-STEALTH_AVAILABLE = spec is not None
+_STEALTH_V2_INSTANCE: Optional[Any] = None
+_STEALTH_LEGACY_FN: Optional[Any] = None
 
-def apply_stealth(page: Page):
+try:
+    from playwright_stealth import Stealth as _StealthCls  # type: ignore
+
+    if hasattr(_StealthCls, "apply_stealth_sync"):
+        _STEALTH_V2_CLS = _StealthCls
+    else:
+        _STEALTH_V2_CLS = None
+except Exception:
+    _STEALTH_V2_CLS = None
+
+if _STEALTH_V2_CLS is None:
+    try:
+        from playwright_stealth import stealth_sync as _legacy_sync  # type: ignore
+
+        _STEALTH_LEGACY_FN = _legacy_sync if callable(_legacy_sync) else None
+    except Exception:
+        _STEALTH_LEGACY_FN = None
+
+STEALTH_AVAILABLE = _STEALTH_V2_CLS is not None or _STEALTH_LEGACY_FN is not None
+_STEALTH_PKG_PRESENT = importlib.util.find_spec("playwright_stealth") is not None
+
+
+def apply_stealth(page: Page) -> None:
+    global _STEALTH_V2_INSTANCE
     if not STEALTH_AVAILABLE:
         return
     try:
-        from playwright_stealth import stealth_sync
-        stealth_sync(page)
+        if _STEALTH_V2_CLS is not None:
+            if _STEALTH_V2_INSTANCE is None:
+                _STEALTH_V2_INSTANCE = _STEALTH_V2_CLS()
+            _STEALTH_V2_INSTANCE.apply_stealth_sync(page)
+        elif _STEALTH_LEGACY_FN is not None:
+            _STEALTH_LEGACY_FN(page)
         safe_print("[INFO] Stealth 적용 완료")
     except Exception as e:
         safe_print(f"[ERROR] Stealth 적용 실패: {str(e)}")
+
+
+# 상품 리스트 대기·파싱 공통 셀렉터 (DOM 변경 시 한곳만 수정)
+_PRODUCT_LIST_SELECTOR = (
+    "li.search-product, "
+    "li.ProductUnit_productUnit__Qd6sv, "
+    "li[data-product-id], "
+    "ul#product-list > li"
+)
 
 HEADLESS = True
 
@@ -94,7 +133,11 @@ class CoupangCrawler:
             safe_print("[PLAYWRIGHT_CHECK] PLAYWRIGHT_BROWSERS_PATH is not set.")
             return
         base = Path(path)
-        bins = list(base.glob("chromium-*/chrome-linux64/chrome")) if base.exists() else []
+        bins: List[Path] = []
+        if base.exists():
+            bins = list(base.glob("chromium-*/chrome-linux64/chrome")) + list(
+                base.glob("chromium-*/chrome-win64/chrome.exe")
+            )
         safe_print(
             f"[PLAYWRIGHT_CHECK] path={path}, exists={base.exists()}, chromium_bin_count={len(bins)}"
         )
@@ -266,10 +309,15 @@ class CoupangCrawler:
             _ensure_windows_proactor_policy()
             use_headless = self._headless if force_headless is None else bool(force_headless)
             self._playwright = sync_playwright().start()
+            # --- launch_persistent_context 의 channel (브라우저 바이너리 선택) ---
+            # 미설정(None): playwright install 로 받은 번들 Chromium — 서버·Docker·CI에 시스템 Chrome이 없어도 동일 동작.
+            # 설정 시: OS에 깔린 브라우저를 씀. 예) chrome, msedge (Playwright 문서의 channel 값과 동일).
+            # 기본을 번들로 둔 이유: 환경마다 설치 유무·버전이 달라져 오차가 나기 쉽기 때문. 필요할 때만 env로 전환.
+            _channel = str(os.environ.get("COUPANG_PLAYWRIGHT_CHANNEL", "")).strip() or None
             self._context = self._playwright.chromium.launch_persistent_context(
                 user_data_dir=self._chrome_user_data_dir,
                 headless=use_headless,
-                channel="chromium",
+                channel=_channel,
                 viewport={"width": 1440, "height": 2000},
                 locale="ko-KR",
                 user_agent=(
@@ -302,6 +350,11 @@ class CoupangCrawler:
             if STEALTH_AVAILABLE:
                 safe_print("[INFO] Stealth 모드 활성화: 탐지 우회 적용 중...")
                 apply_stealth(page)
+            elif _STEALTH_PKG_PRESENT:
+                safe_print(
+                    "[WARN] playwright_stealth는 설치되어 있으나 stealth_sync API를 사용할 수 없습니다. "
+                    "기본 모드로 실행합니다."
+                )
             else:
                 safe_print("[WARN] playwright_stealth 미설치: 기본 모드로 실행합니다. (차단 위험 높음)")
 
@@ -516,10 +569,10 @@ class CoupangCrawler:
             if self._is_blocked(html, page.title()):
                 safe_print("[WAF_BLOCK] 지정된 URL 파싱 중 WAF 차단 발생.")
                 self._stats["blocked"] += 1
-                reason = "BLOCKED_BY_WAF" if STEALTH_AVAILABLE else "BLOCKED_BY_WAF_STEALTH_MISSING"
+                reason = "BLOCKED_BY_WAF" if STEALTH_AVAILABLE else "BLOCKED_BY_WAF_NO_STEALTH"
                 return self._result_with_reason(reason)
 
-            page.wait_for_selector("li.search-product", timeout=10000)
+            page.wait_for_selector(_PRODUCT_LIST_SELECTOR, timeout=10000)
             page.wait_for_timeout(800)
             html = page.content()
             product_count, items = self._parse_top10_from_html(html)
@@ -577,7 +630,7 @@ class CoupangCrawler:
             if req_result is not None:
                 return req_result
 
-            page.wait_for_selector("li.search-product", timeout=12000)
+            page.wait_for_selector(_PRODUCT_LIST_SELECTOR, timeout=12000)
             page.wait_for_timeout(random.randint(900, 1600))
             safe_print(
                 f"[Crawler][playwright] ready keyword={keyword} "
@@ -601,6 +654,15 @@ class CoupangCrawler:
             safe_print(f"[Crawler Error] keyword={keyword}, error=timeout, detail={e}")
             return None
         except Exception as e:
+            err_name = type(e).__name__
+            if err_name == "TargetClosedError" or "TargetClosed" in err_name:
+                safe_print(f"[Crawler Error] keyword={keyword}, browser/context closed: {e!r}")
+                self._last_error = {"code": "BROWSER_CLOSED", "message": str(e)}
+                try:
+                    self.close()
+                except Exception:
+                    pass
+                return None
             try:
                 cur = page.url if page else "N/A"
                 title = (page.title() if page else "N/A") or "N/A"
@@ -637,7 +699,7 @@ class CoupangCrawler:
             cached["reason_code"] = "CACHE_FALLBACK"
             return cached
         if self._stats.get("blocked", 0) > 0:
-            reason = "BLOCKED_BY_WAF" if STEALTH_AVAILABLE else "BLOCKED_BY_WAF_STEALTH_MISSING"
+            reason = "BLOCKED_BY_WAF" if STEALTH_AVAILABLE else "BLOCKED_BY_WAF_NO_STEALTH"
             return self._result_with_reason(reason)
         return self._result_with_reason("CRAWL_FAILED")
 

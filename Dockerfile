@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
 
 # System libraries required by Chromium in headless Linux.
 RUN apt-get update && apt-get install -y --no-install-recommends \
