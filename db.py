@@ -16,8 +16,10 @@ import pymysql
 def _dsn_from_env() -> Dict[str, Any]:
     url = (
         os.environ.get("MYSQL_URL")
+        or os.environ.get("MYSQL_PUBLIC_URL")
         or os.environ.get("MARIADB_URL")
         or os.environ.get("DATABASE_URL")
+        or os.environ.get("DATABASE_PUBLIC_URL")
         or ""
     ).strip()
     if url:
@@ -50,6 +52,21 @@ def _dsn_from_env() -> Dict[str, Any]:
             "Set MYSQL_URL/MARIADB_URL or host/user vars "
             "(MARIADB_HOST+MARIADB_USER, MYSQLHOST+MYSQLUSER)."
         )
+
+    # *.railway.internal 은 Railway 프라이빗 네트워크 안에서만 해석됨 (로컬 PC에서는 연결 불가).
+    if host.endswith(".railway.internal"):
+        railway_like = bool(
+            os.environ.get("RAILWAY_ENVIRONMENT")
+            or os.environ.get("RAILWAY_PROJECT_ID")
+            or os.environ.get("RAILWAY_SERVICE_NAME")
+        )
+        if not railway_like:
+            raise RuntimeError(
+                "MARIADB_HOST ends with .railway.internal — this hostname only works inside Railway. "
+                "For local runs add MYSQL_PUBLIC_URL (TCP Proxy URL from Railway MariaDB) or MYSQL_URL "
+                "with a public host, or remove MARIADB_HOST when using a full DB URL."
+            )
+
     return {
         "host": host,
         "port": int(

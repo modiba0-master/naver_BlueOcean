@@ -150,10 +150,15 @@ class BlueOceanTool:
             return
 
         mysql_url = str(db_cfg.get("mysql_url", "") or db_cfg.get("mariadb_url", "")).strip()
+        mysql_public_url = str(db_cfg.get("mysql_public_url", "") or "").strip()
+        if mysql_public_url and not (os.environ.get("MYSQL_PUBLIC_URL") or "").strip():
+            os.environ["MYSQL_PUBLIC_URL"] = mysql_public_url
         if mysql_url and not (
             (os.environ.get("MYSQL_URL") or "").strip()
+            or (os.environ.get("MYSQL_PUBLIC_URL") or "").strip()
             or (os.environ.get("MARIADB_URL") or "").strip()
             or (os.environ.get("DATABASE_URL") or "").strip()
+            or (os.environ.get("DATABASE_PUBLIC_URL") or "").strip()
         ):
             os.environ["MYSQL_URL"] = mysql_url
 

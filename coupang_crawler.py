@@ -121,8 +121,49 @@ class CoupangCrawler:
                 ".coupang_chrome_profile",
             )
         os.makedirs(self._chrome_user_data_dir, exist_ok=True)
+        # 수동 준비(홈/로그인/검색 대기)와 자동 크롤이 프로필 락을 나누지 않도록 분리
+        self._prep_user_data_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            ".coupang_chrome_profile_prep",
+        )
+        os.makedirs(self._prep_user_data_dir, exist_ok=True)
         if not self._chrome_profile:
             self._chrome_profile = "Default"
+
+    def _sanitize_playwright_browser_env(self) -> None:
+        """Railway 리눅스 경로를 Windows 로컬에 복사하면 Chromium을 못 찾으므로 무효 경로는 제거."""
+        raw = str(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")).strip()
+        if not raw:
+            return
+        norm = raw.replace("\\", "/")
+        if sys.platform == "win32":
+            if norm.startswith("/") and not norm.startswith("//"):
+                safe_print(
+                    "[PLAYWRIGHT_CHECK] Unix 스타일 PLAYWRIGHT_BROWSERS_PATH는 Windows에서 무시합니다. "
+                    "(로컬은 기본 캐시 또는 Windows 경로를 사용합니다.)"
+                )
+                os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+                return
+        try:
+            base = Path(raw)
+        except Exception:
+            os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+            return
+        if not base.exists():
+            safe_print(
+                f"[PLAYWRIGHT_CHECK] PLAYWRIGHT_BROWSERS_PATH={raw!r} 경로 없음 — "
+                "Playwright 기본 브라우저 캐시로 대체합니다."
+            )
+            os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+
+    def _prep_force_headless(self) -> bool:
+        """Linux 서버에 DISPLAY 없으면 headed 실행이 곧바로 죽으므로 headless로 폴백."""
+        if sys.platform == "win32":
+            return False
+        if os.environ.get("DISPLAY"):
+            return False
+        safe_print("[WARN] DISPLAY 없음 — 준비용 창은 headless로 진행합니다 (서버 환경).")
+        return True
 
     def _cache_key(self, keyword: str) -> str:
         return f"{keyword.strip()}_{datetime.now().strftime('%Y%m%d')}"
@@ -301,13 +342,17 @@ class CoupangCrawler:
         one = self._last_success_cache.get(key)
         return dict(one) if one is not None else None
 
-    def _get_page(self, force_headless: Optional[bool] = None) -> Optional[Page]:
+    def _get_page(
+        self, force_headless: Optional[bool] = None, *, prep_profile: bool = False
+    ) -> Optional[Page]:
         if self._page is not None:
             return self._page
         try:
+            self._sanitize_playwright_browser_env()
             self._log_playwright_preflight()
             _ensure_windows_proactor_policy()
             use_headless = self._headless if force_headless is None else bool(force_headless)
+            user_data_dir = self._prep_user_data_dir if prep_profile else self._chrome_user_data_dir
             self._playwright = sync_playwright().start()
             # --- launch_persistent_context 의 channel (브라우저 바이너리 선택) ---
             # 미설정(None): playwright install 로 받은 번들 Chromium — 서버·Docker·CI에 시스템 Chrome이 없어도 동일 동작.
@@ -315,7 +360,7 @@ class CoupangCrawler:
             # 기본을 번들로 둔 이유: 환경마다 설치 유무·버전이 달라져 오차가 나기 쉽기 때문. 필요할 때만 env로 전환.
             _channel = str(os.environ.get("COUPANG_PLAYWRIGHT_CHANNEL", "")).strip() or None
             self._context = self._playwright.chromium.launch_persistent_context(
-                user_data_dir=self._chrome_user_data_dir,
+                user_data_dir=user_data_dir,
                 headless=use_headless,
                 channel=_channel,
                 viewport={"width": 1440, "height": 2000},
@@ -386,7 +431,7 @@ class CoupangCrawler:
     def open_home_ready_session(self, wait_seconds: int = 120) -> bool:
         if self._page is not None:
             self.close()
-        page = self._get_page(force_headless=False)
+        page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
         if page is None:
             return False
         try:
@@ -490,7 +535,7 @@ class CoupangCrawler:
     def bootstrap_login_session(self, wait_seconds: int = 120) -> bool:
         if self._page is not None:
             self.close()
-        page = self._get_page(force_headless=False)
+        page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
         if page is None:
             return False
         try:
@@ -510,7 +555,7 @@ class CoupangCrawler:
     def open_search_ready_session(self, wait_seconds: int = 120) -> bool:
         if self._page is not None:
             self.close()
-        page = self._get_page(force_headless=False)
+        page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
         if page is None:
             return False
         try:
@@ -536,7 +581,7 @@ class CoupangCrawler:
     def open_google_ready_session(self, wait_seconds: int = 180) -> bool:
         if self._page is not None:
             self.close()
-        page = self._get_page(force_headless=False)
+        page = self._get_page(force_headless=self._prep_force_headless(), prep_profile=True)
         if page is None:
             return False
         try:

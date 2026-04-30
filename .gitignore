@@ -5,3 +5,4 @@
 
 # Local Playwright/Chromium profile (do not ship or upload)
 .coupang_chrome_profile/
+.coupang_chrome_profile_prep/
