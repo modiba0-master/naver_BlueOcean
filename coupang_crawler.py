@@ -174,6 +174,7 @@ class CoupangCrawler:
             "top3_items": [],
         }
         self._smoke_preview_png: Optional[bytes] = None
+        self._smoke_timeline_pngs: List[Dict[str, Any]] = []
         env_raw = str(os.environ.get("COUPANG_HEADLESS", "")).strip().lower()
         if env_raw in {"0", "false", "n", "no"}:
             self._headless = False
@@ -209,6 +210,7 @@ class CoupangCrawler:
         with self._io_lock:
             out = dict(self._smoke_status)
             png = self._smoke_preview_png
+            timeline = list(self._smoke_timeline_pngs)
             sub = self._smoke_subproc
         if sub is not None and sub.poll() is None:
             out = {
@@ -227,6 +229,8 @@ class CoupangCrawler:
         out["thread_alive"] = self.is_smoke_playwright_running()
         if png:
             out["preview_png"] = png
+        if timeline:
+            out["timeline_pngs"] = timeline
         return out
 
     @staticmethod
@@ -1185,6 +1189,7 @@ class CoupangCrawler:
         target = str(url).strip() or "https://www.google.com/"
         with self._io_lock:
             self._smoke_preview_png = None
+            self._smoke_timeline_pngs = []
         hint_h_env = "headless=True (COUPANG_SMOKE_HEADLESS) — OS 창 없음. 캡처·phase로 확인."
         hint_h_auto = (
             "headless=True — Linux에 DISPLAY가 없어 자동 headless입니다. "
@@ -1777,6 +1782,15 @@ class CoupangCrawler:
                     shot_png = page.screenshot(type="png", full_page=False)
                     with self._io_lock:
                         self._smoke_preview_png = shot_png
+                        self._smoke_timeline_pngs.append(
+                            {
+                                "tag": shot_tag,
+                                "captured_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "png": shot_png,
+                            }
+                        )
+                        # 메모리 사용량 보호: 최근 4장만 유지
+                        self._smoke_timeline_pngs = self._smoke_timeline_pngs[-4:]
                     saved = self._save_smoke_screenshot_file(shot_png, shot_tag)
                     if saved:
                         safe_print(f"[SMOKE] 스크린샷 저장: {saved}")

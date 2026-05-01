@@ -626,7 +626,7 @@ def run() -> None:
                 "Playwright Chromium 스모크 — 창·로드 확인 (phase / 스크린샷)",
                 expanded=bool(smpv.get("thread_alive")),
             ):
-                view = {k: v for k, v in smpv.items() if k != "preview_png"}
+                view = {k: v for k, v in smpv.items() if k not in ("preview_png", "timeline_pngs")}
                 st.json(view)
                 prev = smpv.get("preview_png")
                 if prev:
@@ -637,6 +637,21 @@ def run() -> None:
                     )
                 elif smpv.get("thread_alive") and smpv.get("phase") not in ("failed", "closed"):
                     st.caption("스크린샷 대기 중이거나 로드가 느립니다. 잠시 후 **Rerun / 새로고침**으로 다시 확인하세요.")
+
+                timeline_pngs = smpv.get("timeline_pngs", [])
+                if isinstance(timeline_pngs, list) and timeline_pngs:
+                    st.markdown("**실행 중 캡처 타임라인(메모리):**")
+                    cols = st.columns(len(timeline_pngs))
+                    for i, shot in enumerate(timeline_pngs):
+                        if not isinstance(shot, dict):
+                            continue
+                        img = shot.get("png")
+                        if not img:
+                            continue
+                        tag = str(shot.get("tag", "shot"))
+                        cap = str(shot.get("captured_at", "-"))
+                        with cols[i]:
+                            st.image(img, caption=f"{tag} / {cap}", use_container_width=True)
 
         timeline_shots = _read_recent_smoke_screenshots(limit=4)
         st.markdown("#### 최근 실행 캡처 타임라인 (초기 + 10초 + 20초 + 30초)")
