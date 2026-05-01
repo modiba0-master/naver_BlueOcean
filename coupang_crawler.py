@@ -22,6 +22,11 @@ import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import BrowserContext, Error, Page, Playwright, TimeoutError, sync_playwright
 
+try:
+    from db import insert_coupang_search_snapshot
+except Exception:
+    insert_coupang_search_snapshot = None
+
 # CP949 환경에서도 깨지지 않게 출력하기 위한 유틸 함수
 def safe_print(*args, **kwargs):
     text = " ".join(map(str, args))
@@ -49,6 +54,24 @@ def _dump_smoke_extract_report(payload: Dict[str, Any]) -> None:
         safe_print(f"[SMOKE] 추출 결과 저장: {out_p}")
     except Exception as ex:
         safe_print(f"[SMOKE] 추출 결과 파일 저장 실패(무시): {ex!r}")
+
+
+def _persist_smoke_extract_report_to_db(payload: Dict[str, Any]) -> None:
+    """
+    스모크 추출 결과를 쿠팡 전용 DB 테이블에 저장한다.
+    기존 주제어 분석 테이블(keyword_metrics 등)과 분리된 경로다.
+    """
+    if insert_coupang_search_snapshot is None:
+        return
+    if not isinstance(payload, dict):
+        return
+    if str(os.environ.get("COUPANG_SMOKE_EXTRACT_DB", "true")).strip().lower() in {"0", "false", "off", "no"}:
+        return
+    try:
+        stored = int(insert_coupang_search_snapshot(payload) or 0)
+        safe_print(f"[SMOKE][DB] 쿠팡 스냅샷 저장 완료 items={stored}")
+    except Exception as db_ex:
+        safe_print(f"[SMOKE][DB] 쿠팡 스냅샷 저장 실패(무시): {db_ex!r}")
 
 
 # --- playwright-stealth (탐지 완화 스크립트 주입) ---
@@ -354,15 +377,35 @@ class CoupangCrawler:
             return None
 
     def _pick_price_won_from_li(self, li: BeautifulSoup) -> str:
-        """가격 블록에서 '숫자+원'만 사용(쿠폰/할인 라벨은 제외). 동일 블록에 여러 원가가 있으면 마지막 매칭을 사용."""
-        area = li.select_one(".PriceArea_priceArea__NntJz") or li.select_one(".sale-price")
+        """
+        가격 텍스트에서 실제 판매가를 우선 추출한다.
+        - custom-oos 블록의 대표 가격(span)을 최우선 사용
+        - '1개당' 같은 단가 안내는 제외
+        - fallback에서는 첫 번째 원화 값을 판매가로 사용
+        """
+        # 1) 최근 DOM: custom-oos (예: 할인율 + 판매가 + 1개당 단가)
+        for n in li.select(".custom-oos span, .custom-oos div, [class*='custom-oos'] span"):
+            t = n.get_text(" ", strip=True)
+            if not t or "개당" in t:
+                continue
+            m = re.search(r"[\d,]+\s*원", t)
+            if m:
+                return re.sub(r"\s+", "", m.group(0))
+
+        # 2) 기존 DOM fallback
+        area = (
+            li.select_one(".PriceArea_priceArea__NntJz")
+            or li.select_one(".sale-price")
+            or li.select_one("[class*='price']")
+        )
         if not area:
             return ""
         blob = area.get_text(" ", strip=True)
         ms = list(re.finditer(r"[\d,]+\s*원", blob))
         if not ms:
             return ""
-        return re.sub(r"\s+", "", ms[-1].group(0))
+        # 일반적으로 첫 번째 값이 대표 판매가(뒤쪽은 단가/보조 문구일 수 있음)
+        return re.sub(r"\s+", "", ms[0].group(0))
 
     def _pick_shipping_from_li(self, li: BeautifulSoup) -> str:
         """배송비/로켓 등 배송 관련 배지만 사용(할인율 % 배지 오탐 방지). 없으면 배송 키워드로 보조 추출."""
@@ -1330,15 +1373,29 @@ class CoupangCrawler:
                                         const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
                                         const text = (el) => (el ? norm(el.textContent) : "");
                                         const pickPrice = (card) => {
+                                            // 1) custom-oos 대표 판매가 우선
+                                            const cands = card.querySelectorAll(
+                                                ".custom-oos span, .custom-oos div, [class*='custom-oos'] span"
+                                            );
+                                            for (const n of cands) {
+                                                const t = norm(n.innerText || n.textContent || "");
+                                                if (!t || t.includes("개당")) continue;
+                                                const mm = t.match(/[\d,]+\s*원/);
+                                                if (mm) return norm(mm[0].replace(/\s+/g, ""));
+                                            }
+                                            // 2) fallback
                                             const area = card.querySelector(".PriceArea_priceArea__NntJz")
-                                                || card.querySelector(".sale-price");
+                                                || card.querySelector(".sale-price")
+                                                || card.querySelector("[class*='price']");
                                             if (!area) return "";
                                             const blob = norm(area.innerText || area.textContent || "");
                                             const re = /[\d,]+\s*원/g;
-                                            let last = "";
+                                            let first = "";
                                             let m;
-                                            while ((m = re.exec(blob)) !== null) last = m[0];
-                                            return last ? norm(last.replace(/\s+/g, "")) : "";
+                                            while ((m = re.exec(blob)) !== null) {
+                                                if (!first) first = m[0];
+                                            }
+                                            return first ? norm(first.replace(/\s+/g, "")) : "";
                                         };
                                         const pickShippingKeywords = (blob) => {
                                             if (!blob) return "";
@@ -1522,24 +1579,26 @@ class CoupangCrawler:
                                     )
                                     safe_print(f"[SMOKE] HTML probe top3={probe.get('top3', [])!r}")
                                     safe_print(f"[SMOKE] HTML probe sample={probe.get('sample', [])!r}")
-                                    _dump_smoke_extract_report(
-                                        {
-                                            "saved_at": datetime.now().isoformat(timespec="seconds"),
-                                            "keyword": search_kw,
-                                            **probe,
-                                        }
-                                    )
+                                    smoke_payload = {
+                                        "saved_at": datetime.now().isoformat(timespec="seconds"),
+                                        "keyword": search_kw,
+                                        "source_type": "smoke",
+                                        **probe,
+                                    }
+                                    _dump_smoke_extract_report(smoke_payload)
+                                    _persist_smoke_extract_report_to_db(smoke_payload)
                                 except Exception as hp_e:
                                     safe_print(f"[SMOKE] HTML probe 실패(무시): {hp_e!r}")
-                                    _dump_smoke_extract_report(
-                                        {
-                                            "saved_at": datetime.now().isoformat(timespec="seconds"),
-                                            "keyword": search_kw,
-                                            "error": repr(hp_e),
-                                            "top3": [],
-                                            "card_count": None,
-                                        }
-                                    )
+                                    smoke_payload = {
+                                        "saved_at": datetime.now().isoformat(timespec="seconds"),
+                                        "keyword": search_kw,
+                                        "source_type": "smoke",
+                                        "error": repr(hp_e),
+                                        "top3": [],
+                                        "card_count": None,
+                                    }
+                                    _dump_smoke_extract_report(smoke_payload)
+                                    _persist_smoke_extract_report_to_db(smoke_payload)
                             except Exception as ce2:
                                 safe_print(f"[SMOKE] 쿠팡 검색 자동 시연 단계 실패: {ce2!r}")
                         else:

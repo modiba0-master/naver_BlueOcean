@@ -739,3 +739,106 @@ def query_market_score_rows(
 
     out.sort(key=lambda x: x["market_score"], reverse=True)
     return out
+
+
+def insert_coupang_search_snapshot(payload: Dict[str, Any]) -> int:
+    """
+    쿠팡 키워드 검색 스냅샷(요약+랭킹 아이템)을 별도 테이블에 저장한다.
+    기존 주제어 분석 테이블과 완전 분리된 저장 경로다.
+    """
+    if not isinstance(payload, dict):
+        return 0
+
+    keyword_text = str(payload.get("keyword", "")).strip()[:255]
+    if not keyword_text:
+        return 0
+
+    raw_saved_at = str(payload.get("saved_at", "")).strip()
+    try:
+        collected_at = datetime.fromisoformat(raw_saved_at) if raw_saved_at else datetime.now()
+    except Exception:
+        collected_at = datetime.now()
+
+    source_type = str(payload.get("source_type", "smoke")).strip()[:32] or "smoke"
+    page_url = str(payload.get("url", "")).strip()[:1000] or None
+    page_title = str(payload.get("title", "")).strip()[:500] or None
+    html_len = payload.get("html_len", None)
+    card_count = payload.get("card_count", None)
+    organic_count = payload.get("organic_count", None)
+
+    def _to_int_or_none(v: Any) -> Optional[int]:
+        if v is None or v == "":
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    top3_items = payload.get("top3", [])
+    if not isinstance(top3_items, list):
+        top3_items = []
+
+    inserted_items = 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO coupang_search_runs
+                (collected_at, source_type, keyword_text, page_url, page_title, html_len, card_count, organic_count, raw_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    collected_at,
+                    source_type,
+                    keyword_text,
+                    page_url,
+                    page_title,
+                    _to_int_or_none(html_len),
+                    _to_int_or_none(card_count),
+                    _to_int_or_none(organic_count),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            run_id = int(cur.lastrowid)
+
+            batch: List[tuple] = []
+            for item in top3_items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    rank_no = int(item.get("rank", 0) or 0)
+                except Exception:
+                    rank_no = 0
+                if rank_no <= 0:
+                    continue
+                batch.append(
+                    (
+                        run_id,
+                        rank_no,
+                        str(item.get("title", "")).strip()[:1000] or None,
+                        str(item.get("price", "")).strip()[:128] or None,
+                        str(item.get("shipping", "")).strip()[:255] or None,
+                        str(item.get("review_count", "")).strip()[:64] or None,
+                        str(item.get("review_score", "")).strip()[:64] or None,
+                        str(item.get("url", "")).strip()[:1200] or None,
+                    )
+                )
+
+            if batch:
+                cur.executemany(
+                    """
+                    INSERT INTO coupang_search_ranked_items
+                    (run_id, rank_no, product_title, price_text, shipping_text, review_count_text, review_score_text, product_url)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                      product_title=VALUES(product_title),
+                      price_text=VALUES(price_text),
+                      shipping_text=VALUES(shipping_text),
+                      review_count_text=VALUES(review_count_text),
+                      review_score_text=VALUES(review_score_text),
+                      product_url=VALUES(product_url)
+                    """,
+                    batch,
+                )
+                inserted_items = len(batch)
+    return inserted_items
