@@ -42,6 +42,23 @@ def _read_last_smoke_extract_top3() -> List[dict]:
         return []
 
 
+def _read_recent_smoke_screenshots(limit: int = 4) -> List[dict]:
+    """최근 스모크 캡처 파일을 시간순으로 반환한다."""
+    base = Path(__file__).resolve().parent / ".smoke"
+    if not base.is_dir():
+        return []
+    files = sorted(base.glob("smoke_step*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+    picked = list(reversed(files[: max(1, int(limit))]))
+    out: List[dict] = []
+    for p in picked:
+        try:
+            ts = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = "-"
+        out.append({"path": str(p), "name": p.name, "captured_at": ts})
+    return out
+
+
 def _chrome_exe_candidates_windows() -> List[str]:
     pf = os.environ.get("PROGRAMFILES", r"C:\Program Files")
     pfx86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
@@ -620,6 +637,20 @@ def run() -> None:
                     )
                 elif smpv.get("thread_alive") and smpv.get("phase") not in ("failed", "closed"):
                     st.caption("스크린샷 대기 중이거나 로드가 느립니다. 잠시 후 **Rerun / 새로고침**으로 다시 확인하세요.")
+
+        timeline_shots = _read_recent_smoke_screenshots(limit=4)
+        st.markdown("#### 최근 실행 캡처 타임라인 (초기 + 10초 + 20초 + 30초)")
+        if timeline_shots:
+            shot_cols = st.columns(len(timeline_shots))
+            for idx, shot in enumerate(timeline_shots):
+                with shot_cols[idx]:
+                    st.image(
+                        shot["path"],
+                        caption=f"{shot['name']} / {shot['captured_at']}",
+                        use_container_width=True,
+                    )
+        else:
+            st.caption("아직 저장된 스모크 캡처가 없습니다. 키워드 검색 1회 실행 후 다시 확인해주세요.")
 
         smoke_top3_items = _read_last_smoke_extract_top3()
         if isinstance(smoke_top3_items, list) and smoke_top3_items:

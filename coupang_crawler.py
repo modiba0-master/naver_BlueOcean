@@ -873,19 +873,35 @@ class CoupangCrawler:
             res = requests.get(req_url, headers=headers, cookies=jar, timeout=12, allow_redirects=True)
             if res.status_code != 200:
                 safe_print(f"[Crawler][requests] status={res.status_code}")
+                self._last_error = {
+                    "code": f"REQUESTS_HTTP_{int(res.status_code)}",
+                    "message": f"requests status={int(res.status_code)}",
+                }
                 return None
             if self._is_blocked(res.text, ""):
                 safe_print("[WAF_BLOCK][requests] blocked signal detected in requests parsing")
                 self._stats["blocked"] += 1
+                self._last_error = {
+                    "code": "REQUESTS_BLOCKED_BY_WAF",
+                    "message": "blocked signal detected in requests response",
+                }
                 return None
             product_count, items = self._parse_top10_from_html(res.text)
             safe_print(f"[Crawler][requests] parsed product_count={product_count} top10_items={len(items)}")
             if product_count <= 0:
+                self._last_error = {
+                    "code": "REQUESTS_NO_PRODUCTS",
+                    "message": "requests parse returned zero products",
+                }
                 return None
             self._last_fetch_source = "requests"
             return self._build_result(product_count, items)
         except Exception as e:
             safe_print(f"[Crawler Error] keyword=REQUESTS_SESSION, error={e!r}")
+            self._last_error = {
+                "code": "REQUESTS_EXCEPTION",
+                "message": repr(e),
+            }
             return None
 
     def bootstrap_login_session(self, wait_seconds: int = 120) -> bool:
@@ -1029,6 +1045,10 @@ class CoupangCrawler:
                 if self._is_blocked(page.content(), page.title()):
                     safe_print("[WAF_BLOCK][playwright] initial load blocked by WAF/CAPTCHA")
                     self._stats["blocked"] += 1
+                    self._last_error = {
+                        "code": "PLAYWRIGHT_BLOCKED_BY_WAF_INITIAL",
+                        "message": "initial load blocked by WAF/CAPTCHA",
+                    }
                     return None
                 self._simulate_human_actions(page)
 
@@ -1053,11 +1073,19 @@ class CoupangCrawler:
                     f"product_count={product_count} top10_items={len(items)}"
                 )
                 if product_count <= 0:
+                    self._last_error = {
+                        "code": "PLAYWRIGHT_NO_PRODUCTS",
+                        "message": "playwright parse returned zero products",
+                    }
                     return None
                 self._last_fetch_source = "playwright"
                 return self._build_result(product_count, items)
             except TimeoutError as e:
                 safe_print(f"[Crawler Error] keyword={keyword}, error=timeout, detail={e}")
+                self._last_error = {
+                    "code": "PLAYWRIGHT_SELECTOR_TIMEOUT",
+                    "message": str(e),
+                }
                 return None
             except Exception as e:
                 err_name = type(e).__name__
@@ -1076,6 +1104,10 @@ class CoupangCrawler:
                     cur = "N/A"
                     title = "N/A"
                 safe_print(f"[Crawler Error] keyword={keyword}, current_url={cur}, title={title}, error={e!r}")
+                self._last_error = {
+                    "code": "PLAYWRIGHT_EXCEPTION",
+                    "message": repr(e),
+                }
                 return None
 
     def crawl_coupang(self, keyword: str) -> Dict[str, Any]:
@@ -1107,6 +1139,21 @@ class CoupangCrawler:
         if self._stats.get("blocked", 0) > 0:
             reason = "BLOCKED_BY_WAF" if STEALTH_AVAILABLE else "BLOCKED_BY_WAF_NO_STEALTH"
             return self._result_with_reason(reason)
+        code = str((self._last_error or {}).get("code", "")).strip().upper()
+        if code == "PLAYWRIGHT_SELECTOR_TIMEOUT":
+            return self._result_with_reason("PLAYWRIGHT_TIMEOUT")
+        if code == "PLAYWRIGHT_NO_PRODUCTS":
+            return self._result_with_reason("NO_PRODUCTS_PARSED")
+        if code.startswith("REQUESTS_HTTP_"):
+            return self._result_with_reason(code)
+        if code == "REQUESTS_NO_PRODUCTS":
+            return self._result_with_reason("REQUESTS_NO_PRODUCTS")
+        if code == "REQUESTS_EXCEPTION":
+            return self._result_with_reason("REQUESTS_EXCEPTION")
+        if code == "PLAYWRIGHT_EXCEPTION":
+            return self._result_with_reason("PLAYWRIGHT_EXCEPTION")
+        if code == "PLAYWRIGHT_BLOCKED_BY_WAF_INITIAL":
+            return self._result_with_reason("BLOCKED_BY_WAF_INITIAL")
         return self._result_with_reason("CRAWL_FAILED")
 
     def is_smoke_playwright_running(self) -> bool:
