@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -6,6 +7,7 @@ import time
 import webbrowser
 from collections import Counter
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pandas as pd
@@ -25,6 +27,19 @@ from report_format import report_to_excel_bytes
 
 _GOOGLE_HOME_URL = "https://www.google.com/"
 _PLAYWRIGHT_SMOKE_MAX_SECONDS = 300.0
+
+
+def _read_last_smoke_extract_top3() -> List[dict]:
+    p = Path(__file__).resolve().parent / ".smoke" / "last_smoke_extract.json"
+    if not p.is_file():
+        return []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        top3 = data.get("top3", []) if isinstance(data, dict) else []
+        return top3 if isinstance(top3, list) else []
+    except Exception:
+        return []
 
 
 def _chrome_exe_candidates_windows() -> List[str]:
@@ -493,29 +508,22 @@ def run() -> None:
                 "이 PC에서 창까지 보려면 저장소를 받아 로컬에서 `streamlit run app_web.py` 를 실행하세요."
             )
         st.caption(
-            "**접속 준비 확인(홈)** 은 설치형 Chrome/기본 브라우저로 구글만 엽니다. "
-            "**Playwright Chromium 확인** 은 번들 Chromium을 **별도 창(로컬 Windows에서는 자식 프로세스)** 으로 연 뒤 최대 "
-            f"{int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초 유지합니다. **[강제 종료]** 로 그 전에 닫을 수 있습니다. "
-            "**접속 준비 확인(검색창)** 은 기존처럼 쿠팡 준비 세션입니다."
+            "**키워드 검색** 은 입력한 쿠팡 키워드로 Playwright Chromium 스모크를 실행합니다. "
+            f"최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초 유지하며, **[강제 종료]** 로 중단할 수 있습니다."
         )
 
-        prep_col1, prep_col2, prep_col3 = st.columns(3)
-        with prep_col1:
-            prep_home_clicked = st.button(
-                "접속 준비 확인(홈)",
-                key="coupang_prep_home_btn",
-                width='stretch',
+        c_input_col1, c_input_col2 = st.columns([3, 1])
+        with c_input_col1:
+            coupang_keyword = st.text_input(
+                "쿠팡 검색 키워드",
+                value="",
+                placeholder="예: 그램 노트북",
+                key="coupang_single_keyword",
             )
-        with prep_col2:
+        with c_input_col2:
             prep_pw_smoke_clicked = st.button(
-                "Playwright Chromium 확인",
+                "키워드 검색",
                 key="coupang_prep_pw_smoke_btn",
-                width='stretch',
-            )
-        with prep_col3:
-            prep_search_clicked = st.button(
-                "접속 준비 확인(검색창)",
-                key="coupang_prep_search_btn",
                 width='stretch',
             )
 
@@ -530,53 +538,47 @@ def run() -> None:
                 f"스모크 Chromium 실행 중 — 최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초 유지 또는 위 버튼으로 즉시 종료."
             )
 
-        if prep_home_clicked:
-            with st.spinner("브라우저에서 구글 검색 화면을 여는 중입니다..."):
-                ok = open_google_home_in_desktop_browser()
-            st.session_state["coupang_prep_status"] = {
-                "mode": "home_google",
-                "ok": bool(ok),
-                "stats": {},
-                "last_error": {}
-                if ok
-                else {"message": "브라우저를 열 수 없습니다. 로컬 PC에서 실행했는지 확인해 주세요."},
-            }
-
         if prep_pw_smoke_clicked:
-            with st.spinner("Playwright Chromium 백그라운드 시작 중..."):
-                ok_start = tool.coupang_crawler.smoke_open_playwright_chromium_window(
-                    url=_GOOGLE_HOME_URL,
-                    wait_seconds=_PLAYWRIGHT_SMOKE_MAX_SECONDS,
-                )
+            if not str(coupang_keyword).strip():
+                st.warning("쿠팡 검색 키워드를 입력해주세요.")
                 ok = False
-                if ok_start:
-                    deadline_poll = time.monotonic() + 10.0
-                    while time.monotonic() < deadline_poll:
-                        st_smoke = tool.coupang_crawler.get_smoke_playwright_status()
-                        if st_smoke.get("phase") == "opened":
-                            ok = True
-                            break
-                        if st_smoke.get("phase") == "failed":
-                            ok = False
-                            break
-                        if not tool.coupang_crawler.is_smoke_playwright_running():
-                            break
-                        time.sleep(0.2)
-                    if not ok and tool.coupang_crawler.is_smoke_playwright_running():
-                        st_smoke = tool.coupang_crawler.get_smoke_playwright_status()
-                        ph = str(st_smoke.get("phase") or "")
-                        if ph not in ("failed", "idle", "closed", "queued"):
-                            ok = True
-            st.session_state["coupang_prep_status"] = {
-                "mode": "playwright_chromium_smoke",
-                "ok": bool(ok),
-                "stats": tool.coupang_crawler.get_stats(),
-                "last_error": tool.coupang_crawler.get_last_error(),
-                "note": (
-                    f"별도 창 유지 최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초. "
-                    "아래 **스모크 상태** 패널에서 phase·스크린샷으로 창/로드 여부를 확인하세요."
-                ),
-            }
+            else:
+                os.environ["COUPANG_SMOKE_COUPANG_QUERY"] = str(coupang_keyword).strip()
+                with st.spinner("Playwright Chromium 백그라운드 시작 중..."):
+                    ok_start = tool.coupang_crawler.smoke_open_playwright_chromium_window(
+                        url=_GOOGLE_HOME_URL,
+                        wait_seconds=_PLAYWRIGHT_SMOKE_MAX_SECONDS,
+                    )
+                    ok = False
+                    if ok_start:
+                        deadline_poll = time.monotonic() + 10.0
+                        while time.monotonic() < deadline_poll:
+                            st_smoke = tool.coupang_crawler.get_smoke_playwright_status()
+                            if st_smoke.get("phase") == "opened":
+                                ok = True
+                                break
+                            if st_smoke.get("phase") == "failed":
+                                ok = False
+                                break
+                            if not tool.coupang_crawler.is_smoke_playwright_running():
+                                break
+                            time.sleep(0.2)
+                        if not ok and tool.coupang_crawler.is_smoke_playwright_running():
+                            st_smoke = tool.coupang_crawler.get_smoke_playwright_status()
+                            ph = str(st_smoke.get("phase") or "")
+                            if ph not in ("failed", "idle", "closed", "queued"):
+                                ok = True
+                st.session_state["coupang_prep_status"] = {
+                    "mode": "playwright_chromium_smoke",
+                    "ok": bool(ok),
+                    "stats": tool.coupang_crawler.get_stats(),
+                    "last_error": tool.coupang_crawler.get_last_error(),
+                    "note": (
+                        f"키워드={str(coupang_keyword).strip()!r}, "
+                        f"별도 창 유지 최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초. "
+                        "아래 **스모크 상태** 패널에서 phase·스크린샷으로 창/로드 여부를 확인하세요."
+                    ),
+                }
 
         if prep_pw_stop_clicked:
             tool.coupang_crawler.stop_smoke_playwright_chromium_window()
@@ -586,16 +588,6 @@ def run() -> None:
                 "stats": tool.coupang_crawler.get_stats(),
                 "last_error": {},
                 "note": "스모크 Chromium 종료 요청을 보냈습니다.",
-            }
-
-        if prep_search_clicked:
-            with st.spinner("쿠팡 검색창 접속 준비 상태를 확인하는 중입니다..."):
-                ok = tool.coupang_crawler.open_search_ready_session(wait_seconds=10)
-            st.session_state["coupang_prep_status"] = {
-                "mode": "search",
-                "ok": bool(ok),
-                "stats": tool.coupang_crawler.get_stats(),
-                "last_error": tool.coupang_crawler.get_last_error(),
             }
 
         prep_status = st.session_state.get("coupang_prep_status")
@@ -629,34 +621,7 @@ def run() -> None:
                 elif smpv.get("thread_alive") and smpv.get("phase") not in ("failed", "closed"):
                     st.caption("스크린샷 대기 중이거나 로드가 느립니다. 잠시 후 **Rerun / 새로고침**으로 다시 확인하세요.")
 
-        c_input_col1, c_input_col2 = st.columns([3, 1])
-        with c_input_col1:
-            coupang_keyword = st.text_input(
-                "쿠팡 검색 키워드",
-                value="",
-                placeholder="예: 챗지피티",
-                key="coupang_single_keyword",
-            )
-        with c_input_col2:
-            search_clicked = st.button(
-                "Top10 조회",
-                key="coupang_top10_search_btn",
-                width='stretch',
-            )
-
-        if search_clicked:
-            if not str(coupang_keyword).strip():
-                st.warning("키워드를 입력해주세요.")
-            else:
-                with st.spinner("쿠팡 Top10 상품을 조회하는 중입니다..."):
-                    crawl_result = tool.coupang_crawler.crawl_coupang(str(coupang_keyword).strip())
-                st.session_state["coupang_last_result"] = crawl_result
-                st.session_state["coupang_last_stats"] = tool.coupang_crawler.get_stats()
-                st.session_state["coupang_last_error"] = tool.coupang_crawler.get_last_error()
-
-        result = st.session_state.get("coupang_last_result", {})
-        smoke_top3_items = smpv.get("top3_items", []) if isinstance(smpv, dict) else []
-        top10_items = result.get("top10_items", []) if isinstance(result, dict) else []
+        smoke_top3_items = _read_last_smoke_extract_top3()
         if isinstance(smoke_top3_items, list) and smoke_top3_items:
             top10_template = pd.DataFrame(
                 [
@@ -681,25 +646,11 @@ def run() -> None:
                 top10_template.at[rk - 1, "상품명"] = str(item.get("title", "")).strip()
                 top10_template.at[rk - 1, "가격(원)"] = str(item.get("price", "")).strip()
                 top10_template.at[rk - 1, "리뷰수"] = str(item.get("review_count", "")).strip()
+                top10_template.at[rk - 1, "평점"] = str(item.get("review_score", "")).strip()
                 top10_template.at[rk - 1, "배송비"] = str(item.get("shipping", "")).strip()
+                top10_template.at[rk - 1, "상품 URL"] = str(item.get("url", "")).strip()
             st.dataframe(top10_template, width='stretch', hide_index=True)
             st.caption("스모크에서 추출한 1~3위만 표시합니다. (4~10위는 빈값 유지)")
-        elif top10_items:
-            top10_df = pd.DataFrame(top10_items)
-            if not top10_df.empty:
-                rename_map = {
-                    "rank": "순위",
-                    "title": "상품명",
-                    "price": "가격(원)",
-                    "review_count": "리뷰수",
-                    "review_score": "평점",
-                    "shipping_fee": "배송비",
-                    "url": "상품 URL",
-                }
-                top10_df = top10_df.rename(columns=rename_map)
-                ordered_cols = ["순위", "상품명", "가격(원)", "리뷰수", "평점", "배송비", "상품 URL"]
-                top10_df = top10_df[[c for c in ordered_cols if c in top10_df.columns]]
-                st.dataframe(top10_df, width='stretch', hide_index=True)
         else:
             top10_template = pd.DataFrame(
                 [
@@ -716,13 +667,7 @@ def run() -> None:
                 ]
             )
             st.dataframe(top10_template, width='stretch', hide_index=True)
-            if isinstance(result, dict) and result.get("reason_code"):
-                st.warning(f"조회 결과가 없습니다. reason_code={result.get('reason_code')}")
-                last_stats = st.session_state.get("coupang_last_stats", {})
-                st.caption(f"crawl_stats={last_stats}")
-                last_error = st.session_state.get("coupang_last_error", {})
-                if last_error:
-                    st.error(f"crawl_last_error={last_error}")
+            st.caption("`.smoke/last_smoke_extract.json`에서 결과를 찾지 못했습니다.")
         st.caption("표시 컬럼: 순위, 상품명, 가격, 리뷰수, 평점, 배송비, 상품 URL")
 
 

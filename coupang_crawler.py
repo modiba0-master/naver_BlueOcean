@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import atexit
+import json
 import math
 import os
 import random
@@ -28,6 +29,27 @@ def safe_print(*args, **kwargs):
         print(text, **kwargs)
     except UnicodeEncodeError:
         print(text.encode("cp949", errors="ignore").decode("cp949", errors="ignore"), **kwargs)
+
+
+def _dump_smoke_extract_report(payload: Dict[str, Any]) -> None:
+    """스모크 HTML 추출 결과를 JSON 파일로 남겨 대시보드 밖에서도 확인 가능하게 한다."""
+    raw = os.environ.get("COUPANG_SMOKE_EXTRACT_JSON")
+    if raw is not None and str(raw).strip().lower() in {"0", "off", "false", "none"}:
+        return
+    if raw and str(raw).strip():
+        out_p = Path(str(raw).strip()).expanduser()
+        if not out_p.is_absolute():
+            out_p = (Path(__file__).resolve().parent / out_p).resolve()
+    else:
+        out_p = Path(__file__).resolve().parent / ".smoke" / "last_smoke_extract.json"
+    try:
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        safe_print(f"[SMOKE] 추출 결과 저장: {out_p}")
+    except Exception as ex:
+        safe_print(f"[SMOKE] 추출 결과 파일 저장 실패(무시): {ex!r}")
+
 
 # --- playwright-stealth (탐지 완화 스크립트 주입) ---
 # PyPI 패키지 "playwright-stealth" 2.x(Mattwmaster58): 동기 경로는 stealth_sync가 아니라
@@ -331,6 +353,83 @@ class CoupangCrawler:
         except Exception:
             return None
 
+    def _pick_price_won_from_li(self, li: BeautifulSoup) -> str:
+        """가격 블록에서 '숫자+원'만 사용(쿠폰/할인 라벨은 제외). 동일 블록에 여러 원가가 있으면 마지막 매칭을 사용."""
+        area = li.select_one(".PriceArea_priceArea__NntJz") or li.select_one(".sale-price")
+        if not area:
+            return ""
+        blob = area.get_text(" ", strip=True)
+        ms = list(re.finditer(r"[\d,]+\s*원", blob))
+        if not ms:
+            return ""
+        return re.sub(r"\s+", "", ms[-1].group(0))
+
+    def _pick_shipping_from_li(self, li: BeautifulSoup) -> str:
+        """배송비/로켓 등 배송 관련 배지만 사용(할인율 % 배지 오탐 방지). 없으면 배송 키워드로 보조 추출."""
+        n = li.select_one(".TextBadge_feePrice__n_gta, [data-badge-type='feePrice']")
+        if n:
+            return n.get_text(" ", strip=True)
+        for sel in (
+            "[class*='DeliveryInfo']",
+            "[class*='deliveryInfo']",
+            "[class*='DeliveryBadge']",
+            "[class*='RocketBadge']",
+            "[class*='RocketDelivery']",
+            "[class*='rocketDelivery']",
+            "[class*='ProductUnit_badge']",
+            "[class*='ImageBadge']",
+            "[class*='BadgeList']",
+        ):
+            n2 = li.select_one(sel)
+            if n2:
+                t = n2.get_text(" ", strip=True)
+                if t and not re.fullmatch(r"\d+%", t.strip()):
+                    return t
+        badge_blob = " ".join(
+            x.get_text(" ", strip=True)
+            for x in li.select(
+                "[class*='Badge'], [class*='badge'], [class*='Delivery'], "
+                "[class*='delivery'], [class*='Label'], [class*='label'], "
+                "[class*='Rocket'], [class*='rocket'], [data-badge-type]"
+            )
+        )
+        kw_hit = self._pick_shipping_keywords_from_text(badge_blob)
+        if kw_hit:
+            return kw_hit
+        return self._pick_shipping_keywords_from_text(li.get_text(" ", strip=True))
+
+    @staticmethod
+    def _pick_shipping_keywords_from_text(blob: str) -> str:
+        """로켓/무료배송/출발·도착 등 검색 결과 카드에 자주 노출되는 배송 문구만 모은다."""
+        if not blob:
+            return ""
+        seen: List[str] = []
+        for kw in (
+            "로켓배송",
+            "판매자로켓",
+            "로켓직구",
+            "로켓그로스",
+            "새벽배송",
+            "오늘 출발",
+            "오늘출발",
+            "도착보장",
+            "내일도착",
+            "내일 도착",
+            "무료배송",
+            "판매자 배송",
+            "판매자배송",
+        ):
+            if kw in blob and kw not in seen:
+                seen.append(kw)
+        return " / ".join(seen)
+
+    def _normalize_review_count_display(self, raw: str) -> str:
+        m = re.search(r"\(\s*([\d,]+)\s*\)", str(raw or ""))
+        if m:
+            return m.group(1).replace(",", "")
+        n = self._parse_int(raw)
+        return str(n) if n is not None else str(raw or "").strip()
+
     def _build_result(self, product_count: int, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         reviews = [float(it["review_count"]) for it in items if it.get("review_count") is not None]
         prices = [float(it["price"]) for it in items if it.get("price") is not None]
@@ -404,37 +503,36 @@ class CoupangCrawler:
             if is_ad:
                 continue
             title_node = li.select_one(".ProductUnit_productNameV2__cV9cw, .name")
-            price_node = li.select_one(
-                ".PriceArea_priceArea__NntJz [class*='fw-text-'], "
-                ".PriceArea_priceArea__NntJz .price-value, "
-                ".sale-price strong, .sale-price em"
-            )
+            price_raw = self._pick_price_won_from_li(li)
             review_count_node = li.select_one(
                 ".ProductRating_productRating__jjf7W [class*='fw-text-'], "
                 ".rating-total-count, .rating-count, .count"
             )
             review_score_node = li.select_one(
                 ".ProductRating_productRating__jjf7W [aria-label], "
+                ".ProductRating_productRating__jjf7W em, "
+                ".ProductRating_productRating__jjf7W strong, "
+                ".ProductRating_productRating__jjf7W [class*='rating'], "
                 ".star .rating"
             )
-            shipping_fee_node = li.select_one(
-                ".TextBadge_feePrice__n_gta, "
-                "[class*='fw-bg-'], .fw-bg-bluegray-100, "
-                "[data-badge-type='feePrice']"
+            link_node = (
+                li.select_one("a[href*='vp/products']")
+                or li.select_one("a[href*='/products/']")
+                or li.select_one("a[href*='www.coupang.com/vp/']")
+                or li.select_one("a[href^='/vp/products']")
+                or li.select_one("a[href]")
             )
-            link_node = li.select_one("a[href]")
 
             title = title_node.get_text(strip=True) if title_node else ""
-            price_raw = price_node.get_text(strip=True) if price_node else ""
             review_count_raw = review_count_node.get_text(strip=True) if review_count_node else ""
             review_score_raw = ""
             if review_score_node is not None:
                 review_score_raw = str(
                     review_score_node.get("aria-label", "") or review_score_node.get_text(strip=True) or ""
                 )
-            shipping_fee_raw = shipping_fee_node.get_text(strip=True) if shipping_fee_node else ""
+            shipping_fee_raw = self._pick_shipping_from_li(li)
             price_num = self._parse_int(price_raw)
-            review_num = self._parse_int(review_count_raw)
+            review_num = self._parse_int(self._normalize_review_count_display(review_count_raw))
             review_score = self._parse_float(review_score_raw)
             url = ""
             if link_node is not None:
@@ -1160,7 +1258,10 @@ class CoupangCrawler:
                                     page.wait_for_timeout(10)
                                 page.wait_for_timeout(220)
 
-                                search_kw = "그램 노트북"
+                                _raw_cq = os.environ.get("COUPANG_SMOKE_COUPANG_QUERY")
+                                search_kw = "그램 노트북" if _raw_cq is None else str(_raw_cq).strip()
+                                if not search_kw:
+                                    raise RuntimeError("COUPANG_SMOKE_COUPANG_QUERY 가 비어 있습니다.")
                                 self._smoke_status_update(
                                     phase="smoke_coupang_search_input",
                                     hint=f"쿠팡 검색창에 입력 중: {search_kw!r}",
@@ -1196,8 +1297,25 @@ class CoupangCrawler:
                                     hint=f"쿠팡 검색 Enter 실행: {search_kw!r}",
                                 )
                                 page.keyboard.press("Enter")
-                                page.wait_for_load_state("domcontentloaded")
-                                page.wait_for_timeout(900)
+                                try:
+                                    page.wait_for_load_state("domcontentloaded", timeout=30000)
+                                except Exception:
+                                    pass
+                                try:
+                                    page.wait_for_load_state("networkidle", timeout=18000)
+                                except Exception:
+                                    pass
+                                page.wait_for_timeout(600)
+                                try:
+                                    page.wait_for_selector(
+                                        "li.ProductUnit_productUnit__Qd6sv, li.search-product, "
+                                        "ul#product-list > li, ul#productList li, li[data-product-id]",
+                                        timeout=22000,
+                                        state="attached",
+                                    )
+                                except Exception:
+                                    safe_print("[SMOKE] 상품 리스트 DOM 대기 타임아웃 — probe는 계속 시도")
+                                page.wait_for_timeout(500)
                                 self._smoke_status_update(
                                     phase="smoke_coupang_search_done",
                                     hint=f"쿠팡 검색 실행 완료: {search_kw!r}",
@@ -1208,53 +1326,220 @@ class CoupangCrawler:
                                         phase="smoke_coupang_html_probe",
                                         hint="결과 페이지 HTML에서 상품명/가격 추출 가능 여부를 확인합니다.",
                                     )
-                                    probe = page.evaluate(
-                                        """() => {
-                                            const text = (el) => (el ? (el.textContent || "").trim() : "");
-                                            const cards = Array.from(document.querySelectorAll("li.search-product, ul#productList li"));
-                                            const top3 = cards.slice(0, 3).map((card, idx) => {
-                                                const nameEl = card.querySelector(".name, .baby-product-name, .title");
-                                                const priceEl = card.querySelector(".price-value, .sale-price, .price");
-                                                const shipEl = card.querySelector(".delivery, .delivery-info, .badge.rocket, .rocket");
-                                                const reviewEl = card.querySelector(".rating-total-count, .rating-count, .total-rating-count");
-                                                return {
-                                                    rank: idx + 1,
-                                                    title: text(nameEl),
-                                                    price: text(priceEl),
-                                                    shipping: text(shipEl),
-                                                    review_count: text(reviewEl),
-                                                };
-                                            }).filter((x) => x.title);
-                                            const sample = cards.slice(0, 5).map((card) => {
-                                                const nameEl = card.querySelector(".name, .baby-product-name, .title");
-                                                const priceEl = card.querySelector(".price-value, .sale-price, .price");
-                                                return {
-                                                    name: text(nameEl),
-                                                    price: text(priceEl),
-                                                };
-                                            }).filter((x) => x.name);
+                                    _probe_js = r"""() => {
+                                        const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+                                        const text = (el) => (el ? norm(el.textContent) : "");
+                                        const pickPrice = (card) => {
+                                            const area = card.querySelector(".PriceArea_priceArea__NntJz")
+                                                || card.querySelector(".sale-price");
+                                            if (!area) return "";
+                                            const blob = norm(area.innerText || area.textContent || "");
+                                            const re = /[\d,]+\s*원/g;
+                                            let last = "";
+                                            let m;
+                                            while ((m = re.exec(blob)) !== null) last = m[0];
+                                            return last ? norm(last.replace(/\s+/g, "")) : "";
+                                        };
+                                        const pickShippingKeywords = (blob) => {
+                                            if (!blob) return "";
+                                            const kws = [
+                                                "로켓배송", "판매자로켓", "로켓직구", "로켓그로스", "새벽배송",
+                                                "오늘 출발", "오늘출발", "도착보장", "내일도착", "내일 도착",
+                                                "무료배송", "판매자 배송", "판매자배송",
+                                            ];
+                                            const seen = [];
+                                            for (let i = 0; i < kws.length; i++) {
+                                                const kw = kws[i];
+                                                if (blob.includes(kw) && seen.indexOf(kw) === -1) seen.push(kw);
+                                            }
+                                            return seen.join(" / ");
+                                        };
+                                        const pickShipping = (card) => {
+                                            const fee = card.querySelector(
+                                                ".TextBadge_feePrice__n_gta, [data-badge-type='feePrice']"
+                                            );
+                                            if (fee) return norm(fee.textContent);
+                                            const trySels = [
+                                                "[class*='DeliveryInfo']",
+                                                "[class*='deliveryInfo']",
+                                                "[class*='DeliveryBadge']",
+                                                "[class*='RocketBadge']",
+                                                "[class*='RocketDelivery']",
+                                                "[class*='rocketDelivery']",
+                                                "[class*='ProductUnit_badge']",
+                                                "[class*='ImageBadge']",
+                                                "[class*='BadgeList']",
+                                            ];
+                                            for (let i = 0; i < trySels.length; i++) {
+                                                const n = card.querySelector(trySels[i]);
+                                                if (n) {
+                                                    const t = norm(n.textContent);
+                                                    if (t && !/^\d+%$/.test(t)) return t;
+                                                }
+                                            }
+                                            const badgeBlob = Array.from(card.querySelectorAll(
+                                                "[class*='Badge'], [class*='badge'], [class*='Delivery'], "
+                                                + "[class*='delivery'], [class*='Label'], [class*='label'], "
+                                                + "[class*='Rocket'], [class*='rocket'], [data-badge-type]"
+                                            )).map((n) => norm(n.textContent)).join(" ");
+                                            let kw = pickShippingKeywords(badgeBlob);
+                                            if (kw) return kw;
+                                            kw = pickShippingKeywords(norm(card.innerText || card.textContent || ""));
+                                            return kw;
+                                        };
+                                        const pickReviewScore = (card) => {
+                                            const wrap = card.querySelector(".ProductRating_productRating__jjf7W");
+                                            if (!wrap) return "";
+                                            const labeled = wrap.querySelector("[aria-label]");
+                                            if (labeled) {
+                                                const al = norm(labeled.getAttribute("aria-label") || "");
+                                                const am = al.match(/(\d+(?:\.\d+)?)/);
+                                                if (am) return am[1];
+                                            }
+                                            const starSels = ["em", "strong", "[class*='rating']"];
+                                            for (let si = 0; si < starSels.length; si++) {
+                                                const n = wrap.querySelector(starSels[si]);
+                                                if (n) {
+                                                    const t = norm(n.textContent);
+                                                    const tm = t.match(/(\d+(?:\.\d+)?)/);
+                                                    if (tm) return tm[1];
+                                                }
+                                            }
+                                            return "";
+                                        };
+                                        const pickProductUrl = (card) => {
+                                            let a = card.querySelector(
+                                                "a[href*='vp/products'], a[href*='/products/'], "
+                                                + "a[href*='www.coupang.com/vp/'], a[href^='/vp/products']"
+                                            );
+                                            if (!a) a = card.querySelector("a[href]");
+                                            if (!a) return "";
+                                            let href = (a.getAttribute("href") || "").trim();
+                                            if (!href) return "";
+                                            if (href.startsWith("/")) href = "https://www.coupang.com" + href;
+                                            return href;
+                                        };
+                                        const pickReview = (card) => {
+                                            const el = card.querySelector(
+                                                ".ProductRating_productRating__jjf7W [class*='fw-text-'], "
+                                                + ".rating-total-count, .rating-count, .count"
+                                            );
+                                            const t = el ? norm(el.textContent) : "";
+                                            const paren = t.match(/\(\s*([\d,]+)\s*\)/);
+                                            if (paren) return paren[1].replace(/,/g, "");
+                                            const digits = t.match(/[\d,]+/);
+                                            return digits ? digits[0].replace(/,/g, "") : t;
+                                        };
+                                        const cards = Array.from(document.querySelectorAll(
+                                            "li.ProductUnit_productUnit__Qd6sv, li.search-product, "
+                                            + "ul#product-list > li, ul#productList li, li[data-product-id]"
+                                        ));
+                                        const isAd = (card) => {
+                                            if (card.querySelector(
+                                                ".search-product__ad-badge, .search-product__ad, .ad-badge-text"
+                                            )) return true;
+                                            if (norm(card.textContent).includes("광고")
+                                                && !card.querySelector("[class*='RankMark_rank']")) return true;
+                                            return false;
+                                        };
+                                        const extract = (card) => {
+                                            const titleEl = card.querySelector(
+                                                ".ProductUnit_productNameV2__cV9cw, .name"
+                                            );
                                             return {
-                                                url: location.href,
-                                                title: document.title || "",
-                                                html_len: (document.documentElement?.outerHTML || "").length,
-                                                card_count: cards.length,
-                                                top3: top3,
-                                                sample: sample,
+                                                title: text(titleEl),
+                                                price: pickPrice(card),
+                                                shipping: pickShipping(card),
+                                                review_count: pickReview(card),
+                                                review_score: pickReviewScore(card),
+                                                url: pickProductUrl(card),
                                             };
-                                        }"""
-                                    )
+                                        };
+                                        const organic = [];
+                                        for (const card of cards) {
+                                            if (isAd(card)) continue;
+                                            const row = extract(card);
+                                            if (row.title && /[\d,]+원/.test(row.price)) organic.push(row);
+                                        }
+                                        const top3 = organic.slice(0, 3).map((row, idx) => ({
+                                            rank: idx + 1,
+                                            title: row.title,
+                                            price: row.price,
+                                            shipping: row.shipping,
+                                            review_count: row.review_count,
+                                            review_score: row.review_score,
+                                            url: row.url,
+                                        }));
+                                        const sample = organic.slice(0, 5).map((row) => ({
+                                            name: row.title,
+                                            price: row.price,
+                                            review_score: row.review_score,
+                                            url: row.url,
+                                        }));
+                                        const html = document.documentElement && document.documentElement.outerHTML;
+                                        return {
+                                            url: location.href,
+                                            title: document.title || "",
+                                            html_len: html ? html.length : 0,
+                                            card_count: cards.length,
+                                            organic_count: organic.length,
+                                            top3: top3,
+                                            sample: sample,
+                                        };
+                                    }"""
+                                    probe: Optional[Dict[str, Any]] = None
+                                    last_ev: Optional[Exception] = None
+                                    for _probe_try in range(4):
+                                        try:
+                                            probe = page.evaluate(_probe_js)
+                                            break
+                                        except Exception as ev_e:
+                                            last_ev = ev_e
+                                            msg = str(ev_e).lower()
+                                            if (
+                                                "execution context was destroyed" in msg
+                                                or "navigation" in msg
+                                            ):
+                                                page.wait_for_timeout(900 + _probe_try * 700)
+                                                try:
+                                                    page.wait_for_load_state(
+                                                        "domcontentloaded", timeout=20000
+                                                    )
+                                                except Exception:
+                                                    pass
+                                                continue
+                                            raise
+                                    if probe is None:
+                                        raise last_ev or RuntimeError("HTML probe evaluate failed")
                                     self._smoke_status_update(top3_items=probe.get("top3", []))
                                     safe_print(
                                         "[SMOKE] HTML probe: "
                                         f"url={probe.get('url','')} "
                                         f"title={probe.get('title','')!r} "
                                         f"html_len={probe.get('html_len',0)} "
-                                        f"card_count={probe.get('card_count',0)}"
+                                        f"card_count={probe.get('card_count',0)} "
+                                        f"organic_count={probe.get('organic_count', 0)}"
                                     )
                                     safe_print(f"[SMOKE] HTML probe top3={probe.get('top3', [])!r}")
                                     safe_print(f"[SMOKE] HTML probe sample={probe.get('sample', [])!r}")
+                                    _dump_smoke_extract_report(
+                                        {
+                                            "saved_at": datetime.now().isoformat(timespec="seconds"),
+                                            "keyword": search_kw,
+                                            **probe,
+                                        }
+                                    )
                                 except Exception as hp_e:
                                     safe_print(f"[SMOKE] HTML probe 실패(무시): {hp_e!r}")
+                                    _dump_smoke_extract_report(
+                                        {
+                                            "saved_at": datetime.now().isoformat(timespec="seconds"),
+                                            "keyword": search_kw,
+                                            "error": repr(hp_e),
+                                            "top3": [],
+                                            "card_count": None,
+                                        }
+                                    )
                             except Exception as ce2:
                                 safe_print(f"[SMOKE] 쿠팡 검색 자동 시연 단계 실패: {ce2!r}")
                         else:
