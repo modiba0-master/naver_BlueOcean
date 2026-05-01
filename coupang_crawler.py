@@ -333,6 +333,24 @@ class CoupangCrawler:
     def _cache_key(self, keyword: str) -> str:
         return f"{keyword.strip()}_{datetime.now().strftime('%Y%m%d')}"
 
+    def _save_smoke_screenshot_file(self, png_bytes: bytes, tag: str) -> Optional[str]:
+        """
+        스모크 캡처 PNG를 .smoke 폴더에 저장한다.
+        파일명 예: smoke_step0_open_20260501_220900.png
+        """
+        try:
+            out_dir = Path(__file__).resolve().parent / ".smoke"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_tag = re.sub(r"[^a-zA-Z0-9_-]", "_", str(tag or "shot"))
+            out_path = out_dir / f"smoke_{safe_tag}_{ts}.png"
+            with open(out_path, "wb") as f:
+                f.write(png_bytes)
+            return str(out_path)
+        except Exception as e:
+            safe_print(f"[SMOKE] 스크린샷 파일 저장 실패(무시): {e!r}")
+            return None
+
     def _fallback_profile_dir(self, prep_profile: bool) -> str:
         suffix = "prep" if prep_profile else "crawl"
         return os.path.join(
@@ -1685,10 +1703,39 @@ class CoupangCrawler:
                 page_url=purl,
                 page_title=ptitle,
                 opened_at=time.time(),
-                hint="첫 로드 완료. 유지 시간 동안 창을 확인하거나 대시보드 캡처를 참고하세요.",
+                hint=(
+                    "첫 로드 완료. 초기 1회 + 10초 간격 3회(총 4회) 자동 캡처를 진행합니다."
+                ),
             )
             with self._io_lock:
                 self._last_error = {}
+
+            # 요청 사양: 초기 화면 1회 + 10초 간격 3회 추가 캡처
+            # 총 4장의 캡처를 파일로 남기고, 마지막 캡처를 대시보드 미리보기에 유지한다.
+            shot_plan = [
+                (0, "step0_open"),
+                (10, "step1_10s"),
+                (20, "step2_20s"),
+                (30, "step3_30s"),
+            ]
+            start_ts = time.monotonic()
+            for sec_mark, shot_tag in shot_plan:
+                while (time.monotonic() - start_ts) < float(sec_mark):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(0.2)
+                if stop_event.is_set():
+                    break
+                try:
+                    shot_png = page.screenshot(type="png", full_page=False)
+                    with self._io_lock:
+                        self._smoke_preview_png = shot_png
+                    saved = self._save_smoke_screenshot_file(shot_png, shot_tag)
+                    if saved:
+                        safe_print(f"[SMOKE] 스크린샷 저장: {saved}")
+                except Exception as shot_err:
+                    safe_print(f"[SMOKE] 주기 캡처 실패(무시): {shot_err!r}")
+
             deadline = time.monotonic() + float(max_wait_seconds)
             poll = 0.5
             self._smoke_status_update(phase="holding")
