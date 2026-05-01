@@ -4,7 +4,10 @@ import atexit
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -109,6 +112,9 @@ class CoupangCrawler:
         self._io_lock = threading.RLock()
         self._smoke_thread: Optional[threading.Thread] = None
         self._smoke_stop_event: Optional[threading.Event] = None
+        self._smoke_subproc: Optional[subprocess.Popen] = None
+        self._smoke_stop_file: Optional[str] = None
+        self._smoke_tmpdir: Optional[str] = None
         self._smoke_status: Dict[str, Any] = {
             "phase": "idle",
             "headless": None,
@@ -152,13 +158,97 @@ class CoupangCrawler:
 
     def get_smoke_playwright_status(self) -> Dict[str, Any]:
         """대시보드에서 스모크 Chromium 진행 여부 확인용(phase·URL·캡처 등)."""
+        self._maybe_reap_smoke_subprocess()
         with self._io_lock:
             out = dict(self._smoke_status)
             png = self._smoke_preview_png
+            sub = self._smoke_subproc
+        if sub is not None and sub.poll() is None:
+            out = {
+                **out,
+                "phase": "windows_subprocess_running",
+                "thread_alive": True,
+                "headless": False,
+                "subprocess_pid": sub.pid,
+                "hint": (
+                    "별도 Python 프로세스에서 headed Chromium이 실행 중입니다. "
+                    "작업 표시줄·Alt+Tab에서 창을 확인하세요. "
+                    "Railway 등 **원격 대시보드**만 쓰는 경우 Chromium은 **서버**에서만 떠서 이 PC에는 보이지 않습니다."
+                ),
+            }
+            return out
         out["thread_alive"] = self.is_smoke_playwright_running()
         if png:
             out["preview_png"] = png
         return out
+
+    @staticmethod
+    def _smoke_use_subprocess_launch() -> bool:
+        """Windows 로컬에서 Streamlit이 데몬 스레드일 때 headed 창이 안 뜨는 경우를 줄이기 위해 별도 프로세스로 실행."""
+        if sys.platform != "win32":
+            return False
+        if os.environ.get("COUPANG_SMOKE_INPROC") == "1":
+            return False
+        if (
+            os.environ.get("RAILWAY_ENVIRONMENT")
+            or os.environ.get("RAILWAY_SERVICE_NAME")
+            or os.environ.get("RAILWAY_PROJECT_ID")
+        ):
+            return False
+        return True
+
+    def _maybe_reap_smoke_subprocess(self) -> None:
+        with self._io_lock:
+            sub = self._smoke_subproc
+            tmp = self._smoke_tmpdir
+        if sub is None:
+            return
+        if sub.poll() is None:
+            return
+        with self._io_lock:
+            self._smoke_subproc = None
+            self._smoke_stop_file = None
+            self._smoke_tmpdir = None
+            self._smoke_status = {
+                **self._smoke_status,
+                "phase": "closed",
+                "closed_at": time.time(),
+                "thread_alive": False,
+                "hint": "스모크 자식 프로세스가 종료되었습니다.",
+            }
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _terminate_smoke_subprocess_if_any(self) -> None:
+        self._maybe_reap_smoke_subprocess()
+        with self._io_lock:
+            sub = self._smoke_subproc
+            sf = self._smoke_stop_file
+            tmp = self._smoke_tmpdir
+            self._smoke_subproc = None
+            self._smoke_stop_file = None
+            self._smoke_tmpdir = None
+        if sf:
+            try:
+                os.makedirs(os.path.dirname(sf), exist_ok=True)
+            except OSError:
+                pass
+            try:
+                with open(sf, "w", encoding="utf-8") as fp:
+                    fp.write("stop")
+            except OSError:
+                pass
+        if sub is not None and sub.poll() is None:
+            try:
+                sub.terminate()
+                sub.wait(timeout=12.0)
+            except Exception:
+                try:
+                    sub.kill()
+                except Exception:
+                    pass
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def _sanitize_playwright_browser_env(self) -> None:
         """Railway 리눅스 경로를 Windows 로컬에 복사하면 Chromium을 못 찾으므로 무효 경로는 제거."""
@@ -805,12 +895,17 @@ class CoupangCrawler:
         return self._result_with_reason("CRAWL_FAILED")
 
     def is_smoke_playwright_running(self) -> bool:
+        self._maybe_reap_smoke_subprocess()
         with self._io_lock:
+            sub = self._smoke_subproc
             t = self._smoke_thread
+        if sub is not None and sub.poll() is None:
+            return True
         return t is not None and t.is_alive()
 
     def stop_smoke_playwright_chromium_window(self, join_timeout: float = 20.0) -> None:
         """백그라운드 스모크 Chromium을 즉시 닫도록 신호를 보낸 뒤 스레드 종료를 기다린다."""
+        self._terminate_smoke_subprocess_if_any()
         thr: Optional[threading.Thread] = None
         with self._io_lock:
             ev = self._smoke_stop_event
@@ -829,9 +924,13 @@ class CoupangCrawler:
         with self._io_lock:
             self._smoke_preview_png = None
         hint_h = (
-            "headless=True — OS 창은 없고, 아래 대시보드 캡처·phase로만 확인됩니다. (Railway/Docker 일반)"
+            "headless=True (COUPANG_SMOKE_HEADLESS) — OS 창 없음. 캡처·phase로 확인하거나 "
+            "로컬 PC에서 스모크 시 기본값(headless=False)을 쓰세요."
         )
-        hint_v = "headless=False — Playwright Chromium 별도 창이 데스크톱에 떠야 합니다."
+        hint_v = (
+            "headless=False(스모크 기본) — Playwright Chromium이 별도 창으로 보여야 합니다. "
+            "Railway 등 DISPLAY 없는 Linux에서 기동이 실패하면 COUPANG_SMOKE_HEADLESS=true 로 전환."
+        )
         self._smoke_status_update(
             phase="launching",
             target_url=target,
@@ -845,7 +944,14 @@ class CoupangCrawler:
         self._sanitize_playwright_browser_env()
         self._log_playwright_preflight()
         _ensure_windows_proactor_policy()
-        use_headless = self._prep_force_headless()
+        # 스모크만 기본 headed(headless=False)로 과정을 눈으로 확인. 서버 전용이면 COUPANG_SMOKE_HEADLESS=true.
+        _sh = str(os.environ.get("COUPANG_SMOKE_HEADLESS", "")).strip().lower()
+        if _sh in {"1", "true", "y", "yes"}:
+            use_headless = True
+        elif _sh in {"0", "false", "n", "no"}:
+            use_headless = False
+        else:
+            use_headless = False
         self._smoke_status_update(headless=use_headless, hint=hint_h if use_headless else hint_v)
         _channel = str(os.environ.get("COUPANG_PLAYWRIGHT_CHANNEL", "")).strip() or None
         pw: Optional[Playwright] = None
@@ -875,6 +981,25 @@ class CoupangCrawler:
             self._smoke_status_update(phase="navigating")
             page.goto(target, wait_until="domcontentloaded")
             safe_print(f"[SMOKE] Playwright Chromium 준비 완료 url={target} headless={use_headless}")
+            try:
+                page.evaluate(
+                    """async () => {
+                        const link = document.createElement('link');
+                        link.rel = 'stylesheet';
+                        link.href = 'https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;700&display=swap';
+                        document.head.appendChild(link);
+                        await new Promise((r) => setTimeout(r, 500));
+                        if (document.fonts && document.fonts.ready) {
+                            await document.fonts.ready;
+                        }
+                    }"""
+                )
+                page.add_style_tag(
+                    content="html, body, input, textarea, button { font-family: 'Noto Sans KR', sans-serif !important; }"
+                )
+                page.wait_for_timeout(500)
+            except Exception as fe:
+                safe_print(f"[SMOKE] 웹폰트 주입 생략/실패: {fe!r}")
             try:
                 png = page.screenshot(type="png", full_page=False)
             except Exception as cap_err:
@@ -949,34 +1074,87 @@ class CoupangCrawler:
         max_wait_seconds: float = 300.0,
     ) -> bool:
         max_wait_seconds = max(5.0, float(max_wait_seconds))
+        target = str(url).strip() or "https://www.google.com/"
         old_thr: Optional[threading.Thread] = None
         old_ev: Optional[threading.Event] = None
         with self._io_lock:
             old_thr = self._smoke_thread
             old_ev = self._smoke_stop_event
             self._smoke_preview_png = None
-            self._smoke_stop_event = threading.Event()
-            stop_ev = self._smoke_stop_event
-            self._smoke_thread = None
         if old_ev is not None:
             old_ev.set()
         if old_thr is not None:
             old_thr.join(timeout=20.0)
 
+        self._terminate_smoke_subprocess_if_any()
+
         self._smoke_status_update(
             phase="queued",
-            target_url=str(url).strip() or "https://www.google.com/",
+            target_url=target,
             headless=None,
             page_url="",
             page_title="",
             opened_at=None,
             closed_at=None,
             error="",
-            hint="스모크 스레드를 시작합니다.",
+            hint="스모크 Chromium을 시작합니다.",
         )
 
+        if CoupangCrawler._smoke_use_subprocess_launch():
+            tmpd = tempfile.mkdtemp(prefix="modiba_pwsmoke_")
+            stopf = os.path.join(tmpd, "stop.txt")
+            script = os.path.abspath(__file__)
+            cmd = [
+                sys.executable,
+                script,
+                "--smoke-child",
+                target,
+                str(int(max_wait_seconds)),
+                stopf,
+            ]
+            cwd = os.path.dirname(script)
+            cflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=cflags,
+                )
+            except OSError as exc:
+                self._smoke_status_update(
+                    phase="failed",
+                    error=f"subprocess_spawn:{exc}",
+                    closed_at=time.time(),
+                    hint=str(exc),
+                )
+                shutil.rmtree(tmpd, ignore_errors=True)
+                return False
+            with self._io_lock:
+                self._smoke_subproc = proc
+                self._smoke_stop_file = stopf
+                self._smoke_tmpdir = tmpd
+                self._smoke_thread = None
+                self._smoke_stop_event = None
+            self._smoke_status_update(
+                phase="windows_subprocess",
+                headless=False,
+                subprocess_pid=proc.pid,
+                hint=(
+                    "자식 프로세스에서 headed Chromium을 실행했습니다. 작업 표시줄에서 창을 확인하세요. "
+                    "브라우저로 Railway 주소만 연 경우 창은 서버에만 뜨고 이 PC에는 보이지 않습니다."
+                ),
+            )
+            return True
+
+        with self._io_lock:
+            self._smoke_stop_event = threading.Event()
+            stop_ev = self._smoke_stop_event
+
         def runner() -> None:
-            self._run_smoke_worker(url, max_wait_seconds, stop_ev)
+            self._run_smoke_worker(target, max_wait_seconds, stop_ev)
 
         t = threading.Thread(target=runner, name="pw-smoke-chromium", daemon=True)
         with self._io_lock:
@@ -1050,6 +1228,27 @@ def save_to_excel(result_dict: Dict[str, Any]):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 5 and sys.argv[1] == "--smoke-child":
+        _child_url = sys.argv[2]
+        _child_sec = float(sys.argv[3])
+        _child_stopf = sys.argv[4]
+        _ensure_windows_proactor_policy()
+        _smoke_crawler = CoupangCrawler()
+        _smoke_ev = threading.Event()
+
+        def _watch_smoke_stop_file() -> None:
+            while not _smoke_ev.wait(0.35):
+                try:
+                    if os.path.isfile(_child_stopf):
+                        _smoke_ev.set()
+                        return
+                except OSError:
+                    pass
+
+        threading.Thread(target=_watch_smoke_stop_file, daemon=True).start()
+        _smoke_crawler._run_smoke_worker(_child_url, _child_sec, _smoke_ev)
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(description="Coupang crawler utility")
     parser.add_argument("--keyword", default="페이스 리프팅 밴드", help="검색 키워드")
     parser.add_argument(

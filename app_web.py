@@ -485,11 +485,16 @@ def run() -> None:
     with tab_coupang:
         st.subheader("쿠팡 상품 키워드 분석")
         st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시합니다.")
+        if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_NAME"):
+            st.warning(
+                "**원격 배포(Railway 등)에서 실행 중입니다.** Playwright Chromium 창은 **서버 안**에서만 열리며, "
+                "지금 보고 있는 PC 화면에는 **창이 나타나지 않습니다**. 스모크 상태·스크린샷으로만 확인됩니다. "
+                "이 PC에서 직접 창을 보려면 저장소를 클론한 뒤 **`streamlit run app_web.py`** 를 로컬에서 실행하세요."
+            )
         st.caption(
             "**접속 준비 확인(홈)** 은 설치형 Chrome/기본 브라우저로 구글만 엽니다. "
-            "**Playwright Chromium 확인** 은 번들 Chromium을 **별도 창**으로 연 뒤 최대 "
+            "**Playwright Chromium 확인** 은 번들 Chromium을 **별도 창(로컬 Windows에서는 자식 프로세스)** 으로 연 뒤 최대 "
             f"{int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초 유지합니다. **[강제 종료]** 로 그 전에 닫을 수 있습니다. "
-            "(서버에 DISPLAY 없으면 headless로 기동만 확인.) "
             "**접속 준비 확인(검색창)** 은 기존처럼 쿠팡 준비 세션입니다."
         )
 
