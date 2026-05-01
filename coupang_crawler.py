@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import atexit
+import math
 import os
 import random
 import re
@@ -125,6 +126,7 @@ class CoupangCrawler:
             "closed_at": None,
             "hint": "",
             "error": "",
+            "top3_items": [],
         }
         self._smoke_preview_png: Optional[bytes] = None
         env_raw = str(os.environ.get("COUPANG_HEADLESS", "")).strip().lower()
@@ -184,18 +186,16 @@ class CoupangCrawler:
 
     @staticmethod
     def _smoke_use_subprocess_launch() -> bool:
-        """Windows 로컬에서 Streamlit이 데몬 스레드일 때 headed 창이 안 뜨는 경우를 줄이기 위해 별도 프로세스로 실행."""
-        if sys.platform != "win32":
-            return False
-        if os.environ.get("COUPANG_SMOKE_INPROC") == "1":
-            return False
+        """기본은 in-process(상태 공유). 필요 시 COUPANG_SMOKE_SUBPROCESS=1 로만 별도 프로세스 실행."""
+        if str(os.environ.get("COUPANG_SMOKE_SUBPROCESS", "")).strip() == "1":
+            return sys.platform == "win32"
         if (
             os.environ.get("RAILWAY_ENVIRONMENT")
             or os.environ.get("RAILWAY_SERVICE_NAME")
             or os.environ.get("RAILWAY_PROJECT_ID")
         ):
             return False
-        return True
+        return False
 
     def _maybe_reap_smoke_subprocess(self) -> None:
         with self._io_lock:
@@ -939,6 +939,7 @@ class CoupangCrawler:
             opened_at=None,
             closed_at=None,
             error="",
+            top3_items=[],
             hint="브라우저 기동 중…",
         )
         self._sanitize_playwright_browser_env()
@@ -967,6 +968,30 @@ class CoupangCrawler:
             use_headless = False
             _smoke_hint = hint_v
         self._smoke_status_update(headless=use_headless, hint=_smoke_hint)
+        _raw_ss = os.environ.get("COUPANG_SMOKE_STORAGE_STATE")
+        smoke_storage_state_path = str(_raw_ss).strip() if _raw_ss is not None else ""
+        if not smoke_storage_state_path:
+            smoke_storage_state_path = ".smoke/coupang_state.json"
+        elif smoke_storage_state_path.lower() in {"0", "off", "false", "none"}:
+            smoke_storage_state_path = ""
+        context_kwargs: Dict[str, Any] = {
+            "viewport": {"width": 1280, "height": 900},
+            "locale": "ko-KR",
+        }
+        if smoke_storage_state_path:
+            try:
+                _ssp = Path(smoke_storage_state_path).expanduser()
+                if not _ssp.is_absolute():
+                    _ssp = (Path(__file__).resolve().parent / _ssp).resolve()
+                smoke_storage_state_path = str(_ssp)
+                if _ssp.is_file():
+                    context_kwargs["storage_state"] = smoke_storage_state_path
+                    safe_print(f"[SMOKE] storage_state 로드: {smoke_storage_state_path}")
+                else:
+                    safe_print(f"[SMOKE] storage_state 파일 없음(신규 세션 시작): {smoke_storage_state_path}")
+            except Exception as ss_e:
+                safe_print(f"[SMOKE] storage_state 경로 처리 실패(무시): {ss_e!r}")
+                smoke_storage_state_path = ""
         _channel = str(os.environ.get("COUPANG_PLAYWRIGHT_CHANNEL", "")).strip() or None
         pw: Optional[Playwright] = None
         browser = None
@@ -986,10 +1011,7 @@ class CoupangCrawler:
                 ],
             )
             self._smoke_status_update(phase="chromium_launched")
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                locale="ko-KR",
-            )
+            context = browser.new_context(**context_kwargs)
             page = context.new_page()
             page.set_default_timeout(30000)
             self._smoke_status_update(phase="navigating")
@@ -1014,6 +1036,236 @@ class CoupangCrawler:
                 page.wait_for_timeout(500)
             except Exception as fe:
                 safe_print(f"[SMOKE] 웹폰트 주입 생략/실패: {fe!r}")
+
+            # 구글 검색창에 입력 후 Enter (로컬 headed에서 타이핑이 보임). 비활성: COUPANG_SMOKE_GOOGLE_QUERY=""
+            _raw_sq = os.environ.get("COUPANG_SMOKE_GOOGLE_QUERY")
+            google_query = "쿠팡" if _raw_sq is None else str(_raw_sq).strip()
+            if google_query:
+                try:
+                    self._smoke_status_update(
+                        phase="google_search_input",
+                        hint=f"구글 검색창에 입력 중: {google_query!r} (한 글자씩 표시)",
+                    )
+                    box = page.locator("textarea[name='q'], input[name='q']").first
+                    box.wait_for(state="visible", timeout=15000)
+                    box.click(timeout=5000)
+                    page.wait_for_timeout(250)
+                    box.fill("")
+                    page.keyboard.type(google_query, delay=100)
+                    page.wait_for_timeout(400)
+                    page.keyboard.press("Enter")
+                    try:
+                        page.wait_for_url(re.compile(r"/search\?"), timeout=25000)
+                    except Exception:
+                        safe_print("[SMOKE] 검색 결과 URL 대기 타임아웃 — 계속 진행")
+                    page.wait_for_load_state("domcontentloaded")
+                    page.wait_for_timeout(1200)
+                    self._smoke_status_update(
+                        phase="google_search_done",
+                        hint=f"구글 검색 완료: {google_query!r}",
+                    )
+                    safe_print(f"[SMOKE] 구글 검색 실행 완료 query={google_query!r}")
+
+                    # 검색 결과 화면에서 마우스를 한 바퀴 움직인 뒤 쿠팡 공식 도메인 링크 클릭 (headed 시각 확인용)
+                    try:
+                        self._smoke_status_update(
+                            phase="smoke_mouse_circle",
+                            hint="검색 결과 창 안에서 마우스 포인터를 원형으로 한 바퀴 이동합니다.",
+                        )
+                        vp = page.viewport_size or {"width": 1280, "height": 900}
+                        vw = float(vp.get("width", 1280))
+                        vh = float(vp.get("height", 900))
+                        cx = vw / 2.0
+                        cy = vh / 2.0
+                        radius = min(vw, vh) * 0.22
+                        steps = 52
+                        page.mouse.move(cx + radius, cy)
+                        page.wait_for_timeout(40)
+                        for _i in range(1, steps + 1):
+                            ang = (2.0 * math.pi * _i) / steps
+                            page.mouse.move(
+                                cx + radius * math.cos(ang),
+                                cy + radius * math.sin(ang),
+                            )
+                            page.wait_for_timeout(12)
+                        page.wait_for_timeout(200)
+
+                        self._smoke_status_update(
+                            phase="smoke_find_coupang_link",
+                            hint="검색 결과에서 https://www.coupang.com 또는 coupang.com 링크를 찾아 클릭합니다.",
+                        )
+                        coupang_locators = [
+                            page.locator("a").filter(
+                                has_text=re.compile(r"https://www\.coupang\.com", re.I)
+                            ).first,
+                            page.locator('a[href^="https://www.coupang.com"]').first,
+                            page.locator('a[href*="www.coupang.com"]').first,
+                            page.locator('a[href*="coupang.com"]').first,
+                        ]
+                        clicked = False
+                        last_pick_err: Optional[Exception] = None
+                        for loc in coupang_locators:
+                            try:
+                                loc.wait_for(state="visible", timeout=6000)
+                                loc.scroll_into_view_if_needed(timeout=5000)
+                                ctx = page.context
+                                n_before = len(ctx.pages)
+                                loc.click(timeout=15000)
+                                page.wait_for_timeout(350)
+                                if len(ctx.pages) > n_before:
+                                    page = ctx.pages[-1]
+                                    page.wait_for_load_state("domcontentloaded", timeout=25000)
+                                else:
+                                    page.wait_for_url(
+                                        re.compile(r"coupang\.com"),
+                                        timeout=25000,
+                                    )
+                                    page.wait_for_load_state("domcontentloaded")
+                                page.wait_for_timeout(600)
+                                clicked = True
+                                break
+                            except Exception as pe:
+                                last_pick_err = pe
+                                continue
+                        if clicked:
+                            self._smoke_status_update(
+                                phase="smoke_coupang_opened",
+                                hint="쿠팡 페이지로 이동했습니다.",
+                            )
+                            safe_print("[SMOKE] 검색 결과에서 쿠팡 링크 클릭 후 로드까지 완료")
+
+                            # 쿠팡 진입 후 마우스 원형 2바퀴 + 검색창 2회 클릭 + 검색어 입력 + Enter
+                            try:
+                                self._smoke_status_update(
+                                    phase="smoke_coupang_mouse_circle",
+                                    hint="쿠팡 화면 안에서 마우스 포인터를 원형으로 2바퀴 이동합니다.",
+                                )
+                                page.wait_for_timeout(700)
+                                vp2 = page.viewport_size or {"width": 1280, "height": 900}
+                                vw2 = float(vp2.get("width", 1280))
+                                vh2 = float(vp2.get("height", 900))
+                                cx2 = vw2 / 2.0
+                                cy2 = vh2 / 2.0
+                                radius2 = min(vw2, vh2) * 0.20
+                                turns = 2
+                                steps2 = 52 * turns
+                                page.mouse.move(cx2 + radius2, cy2)
+                                page.wait_for_timeout(40)
+                                for _j in range(1, steps2 + 1):
+                                    ang2 = (2.0 * math.pi * _j) / 52.0
+                                    page.mouse.move(
+                                        cx2 + radius2 * math.cos(ang2),
+                                        cy2 + radius2 * math.sin(ang2),
+                                    )
+                                    page.wait_for_timeout(10)
+                                page.wait_for_timeout(220)
+
+                                search_kw = "그램 노트북"
+                                self._smoke_status_update(
+                                    phase="smoke_coupang_search_input",
+                                    hint=f"쿠팡 검색창에 입력 중: {search_kw!r}",
+                                )
+                                input_locators = [
+                                    page.locator("input[name='q']").first,
+                                    page.get_by_placeholder("찾고 싶은 상품을 검색해보세요!").first,
+                                    page.locator("input[placeholder*='상품']").first,
+                                    page.locator("input[type='search']").first,
+                                    page.locator("header input").first,
+                                ]
+                                search_box = None
+                                for in_loc in input_locators:
+                                    try:
+                                        in_loc.wait_for(state="visible", timeout=5000)
+                                        search_box = in_loc
+                                        break
+                                    except Exception:
+                                        continue
+                                if search_box is None:
+                                    raise RuntimeError("쿠팡 검색 입력창을 찾지 못했습니다.")
+
+                                search_box.click(timeout=5000)
+                                page.wait_for_timeout(200)
+                                search_box.click(timeout=5000)
+                                page.wait_for_timeout(220)
+                                search_box.fill("")
+                                page.keyboard.type(search_kw, delay=95)
+                                page.wait_for_timeout(250)
+
+                                self._smoke_status_update(
+                                    phase="smoke_coupang_search_enter",
+                                    hint=f"쿠팡 검색 Enter 실행: {search_kw!r}",
+                                )
+                                page.keyboard.press("Enter")
+                                page.wait_for_load_state("domcontentloaded")
+                                page.wait_for_timeout(900)
+                                self._smoke_status_update(
+                                    phase="smoke_coupang_search_done",
+                                    hint=f"쿠팡 검색 실행 완료: {search_kw!r}",
+                                )
+                                safe_print(f"[SMOKE] 쿠팡 검색 실행 완료 query={search_kw!r}")
+                                try:
+                                    self._smoke_status_update(
+                                        phase="smoke_coupang_html_probe",
+                                        hint="결과 페이지 HTML에서 상품명/가격 추출 가능 여부를 확인합니다.",
+                                    )
+                                    probe = page.evaluate(
+                                        """() => {
+                                            const text = (el) => (el ? (el.textContent || "").trim() : "");
+                                            const cards = Array.from(document.querySelectorAll("li.search-product, ul#productList li"));
+                                            const top3 = cards.slice(0, 3).map((card, idx) => {
+                                                const nameEl = card.querySelector(".name, .baby-product-name, .title");
+                                                const priceEl = card.querySelector(".price-value, .sale-price, .price");
+                                                const shipEl = card.querySelector(".delivery, .delivery-info, .badge.rocket, .rocket");
+                                                const reviewEl = card.querySelector(".rating-total-count, .rating-count, .total-rating-count");
+                                                return {
+                                                    rank: idx + 1,
+                                                    title: text(nameEl),
+                                                    price: text(priceEl),
+                                                    shipping: text(shipEl),
+                                                    review_count: text(reviewEl),
+                                                };
+                                            }).filter((x) => x.title);
+                                            const sample = cards.slice(0, 5).map((card) => {
+                                                const nameEl = card.querySelector(".name, .baby-product-name, .title");
+                                                const priceEl = card.querySelector(".price-value, .sale-price, .price");
+                                                return {
+                                                    name: text(nameEl),
+                                                    price: text(priceEl),
+                                                };
+                                            }).filter((x) => x.name);
+                                            return {
+                                                url: location.href,
+                                                title: document.title || "",
+                                                html_len: (document.documentElement?.outerHTML || "").length,
+                                                card_count: cards.length,
+                                                top3: top3,
+                                                sample: sample,
+                                            };
+                                        }"""
+                                    )
+                                    self._smoke_status_update(top3_items=probe.get("top3", []))
+                                    safe_print(
+                                        "[SMOKE] HTML probe: "
+                                        f"url={probe.get('url','')} "
+                                        f"title={probe.get('title','')!r} "
+                                        f"html_len={probe.get('html_len',0)} "
+                                        f"card_count={probe.get('card_count',0)}"
+                                    )
+                                    safe_print(f"[SMOKE] HTML probe top3={probe.get('top3', [])!r}")
+                                    safe_print(f"[SMOKE] HTML probe sample={probe.get('sample', [])!r}")
+                                except Exception as hp_e:
+                                    safe_print(f"[SMOKE] HTML probe 실패(무시): {hp_e!r}")
+                            except Exception as ce2:
+                                safe_print(f"[SMOKE] 쿠팡 검색 자동 시연 단계 실패: {ce2!r}")
+                        else:
+                            safe_print(
+                                f"[SMOKE] 쿠팡 링크 클릭 단계 건너뜀/실패 — 스크린샷은 현 SERP 기준: {last_pick_err!r}"
+                            )
+                    except Exception as ce:
+                        safe_print(f"[SMOKE] 마우스 원형/쿠팡 클릭 단계 실패 — 스크린샷만 진행: {ce!r}")
+                except Exception as se:
+                    safe_print(f"[SMOKE] 구글 검색 단계 실패 — 스크린샷만 진행: {se!r}")
+
             try:
                 png = page.screenshot(type="png", full_page=False)
             except Exception as cap_err:
@@ -1045,6 +1297,13 @@ class CoupangCrawler:
                     self._smoke_status_update(hint="강제 종료 신호 수신, 브라우저를 닫는 중…")
                     break
                 time.sleep(poll)
+            if smoke_storage_state_path:
+                try:
+                    Path(smoke_storage_state_path).parent.mkdir(parents=True, exist_ok=True)
+                    context.storage_state(path=smoke_storage_state_path)
+                    safe_print(f"[SMOKE] storage_state 저장: {smoke_storage_state_path}")
+                except Exception as ss_w:
+                    safe_print(f"[SMOKE] storage_state 저장 실패(무시): {ss_w!r}")
             safe_print("[SMOKE] 유지 시간 종료 또는 중지에 따라 브라우저를 닫습니다.")
         except Exception as e:
             failed = True

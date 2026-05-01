@@ -8,3 +8,6 @@
 .coupang_chrome_profile_crawl/
 .coupang_chrome_profile_prep/
 .coupang_chrome_profile_*_fallback_*/
+
+# Playwright smoke storage_state (cookies/session — local only)
+.smoke/

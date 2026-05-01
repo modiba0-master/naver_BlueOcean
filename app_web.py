@@ -486,10 +486,11 @@ def run() -> None:
         st.subheader("쿠팡 상품 키워드 분석")
         st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시합니다.")
         if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_NAME"):
-            st.warning(
-                "**원격 배포(Railway 등)에서 실행 중입니다.** Playwright Chromium 창은 **서버 안**에서만 열리며, "
-                "지금 보고 있는 PC 화면에는 **창이 나타나지 않습니다**. 스모크 상태·스크린샷으로만 확인됩니다. "
-                "이 PC에서 직접 창을 보려면 저장소를 클론한 뒤 **`streamlit run app_web.py`** 를 로컬에서 실행하세요."
+            st.info(
+                "Railway 등 **원격 서버**에서 앱이 실행 중입니다. Playwright Chromium 창은 **서버 쪽**에만 열리고, "
+                "지금 쓰는 브라우저가 있는 **이 PC 화면에는 창이 보이지 않습니다.** "
+                "확인은 아래 **스모크 상태·스크린샷**으로 하시면 됩니다. "
+                "이 PC에서 창까지 보려면 저장소를 받아 로컬에서 `streamlit run app_web.py` 를 실행하세요."
             )
         st.caption(
             "**접속 준비 확인(홈)** 은 설치형 Chrome/기본 브라우저로 구글만 엽니다. "
@@ -654,8 +655,36 @@ def run() -> None:
                 st.session_state["coupang_last_error"] = tool.coupang_crawler.get_last_error()
 
         result = st.session_state.get("coupang_last_result", {})
+        smoke_top3_items = smpv.get("top3_items", []) if isinstance(smpv, dict) else []
         top10_items = result.get("top10_items", []) if isinstance(result, dict) else []
-        if top10_items:
+        if isinstance(smoke_top3_items, list) and smoke_top3_items:
+            top10_template = pd.DataFrame(
+                [
+                    {
+                        "순위": rank,
+                        "상품명": "",
+                        "가격(원)": "",
+                        "리뷰수": "",
+                        "평점": "",
+                        "배송비": "",
+                        "상품 URL": "",
+                    }
+                    for rank in range(1, 11)
+                ]
+            )
+            for item in smoke_top3_items[:3]:
+                if not isinstance(item, dict):
+                    continue
+                rk = int(item.get("rank") or 0)
+                if rk < 1 or rk > 10:
+                    continue
+                top10_template.at[rk - 1, "상품명"] = str(item.get("title", "")).strip()
+                top10_template.at[rk - 1, "가격(원)"] = str(item.get("price", "")).strip()
+                top10_template.at[rk - 1, "리뷰수"] = str(item.get("review_count", "")).strip()
+                top10_template.at[rk - 1, "배송비"] = str(item.get("shipping", "")).strip()
+            st.dataframe(top10_template, width='stretch', hide_index=True)
+            st.caption("스모크에서 추출한 1~3위만 표시합니다. (4~10위는 빈값 유지)")
+        elif top10_items:
             top10_df = pd.DataFrame(top10_items)
             if not top10_df.empty:
                 rename_map = {
