@@ -484,11 +484,13 @@ def run() -> None:
         st.subheader("쿠팡 상품 키워드 분석")
         st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시합니다.")
         st.caption(
-            "**접속 준비 확인(홈)** 은 앱에서 쿠팡을 열지 않고, 이 PC의 Chrome(가능 시) 또는 기본 브라우저로 "
-            "구글 검색 화면만 엽니다. (Railway 등 서버에서는 브라우저 창을 띄울 수 없을 수 있습니다.)"
+            "**접속 준비 확인(홈)** 은 설치형 Chrome/기본 브라우저로 구글만 엽니다. "
+            "**Playwright Chromium 확인** 은 대시보드에 끼워 넣지 않고 Playwright 번들 Chromium을 **별도 창**으로 "
+            "연 뒤 잠시 유지합니다(서버에 DISPLAY 없으면 headless로 기동만 확인). "
+            "**접속 준비 확인(검색창)** 은 기존처럼 쿠팡 준비 세션입니다."
         )
 
-        prep_col1, prep_col2 = st.columns(2)
+        prep_col1, prep_col2, prep_col3 = st.columns(3)
         with prep_col1:
             prep_home_clicked = st.button(
                 "접속 준비 확인(홈)",
@@ -496,6 +498,12 @@ def run() -> None:
                 width='stretch',
             )
         with prep_col2:
+            prep_pw_smoke_clicked = st.button(
+                "Playwright Chromium 확인",
+                key="coupang_prep_pw_smoke_btn",
+                width='stretch',
+            )
+        with prep_col3:
             prep_search_clicked = st.button(
                 "접속 준비 확인(검색창)",
                 key="coupang_prep_search_btn",
@@ -512,6 +520,19 @@ def run() -> None:
                 "last_error": {}
                 if ok
                 else {"message": "브라우저를 열 수 없습니다. 로컬 PC에서 실행했는지 확인해 주세요."},
+            }
+
+        if prep_pw_smoke_clicked:
+            with st.spinner("Playwright Chromium을 별도 창으로 여는 중입니다..."):
+                ok = tool.coupang_crawler.smoke_open_playwright_chromium_window(
+                    url=_GOOGLE_HOME_URL,
+                    wait_seconds=35.0,
+                )
+            st.session_state["coupang_prep_status"] = {
+                "mode": "playwright_chromium_smoke",
+                "ok": bool(ok),
+                "stats": tool.coupang_crawler.get_stats(),
+                "last_error": tool.coupang_crawler.get_last_error(),
             }
 
         if prep_search_clicked:

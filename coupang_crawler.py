@@ -776,6 +776,64 @@ class CoupangCrawler:
             return self._result_with_reason(reason)
         return self._result_with_reason("CRAWL_FAILED")
 
+    def smoke_open_playwright_chromium_window(
+        self,
+        url: str = "https://www.google.com/",
+        wait_seconds: float = 35.0,
+    ) -> bool:
+        """
+        크롤러의 persistent 세션(_page/_context)과 별도로 Playwright 번들 Chromium만 연다.
+        Streamlit 안에 임베드하지 않고 OS의 별도 창으로 표시(headless 불가 환경에서는 창 없이 기동만 확인).
+        """
+        wait_seconds = max(5.0, float(wait_seconds))
+        with self._io_lock:
+            self._sanitize_playwright_browser_env()
+            self._log_playwright_preflight()
+            _ensure_windows_proactor_policy()
+            use_headless = self._prep_force_headless()
+            _channel = str(os.environ.get("COUPANG_PLAYWRIGHT_CHANNEL", "")).strip() or None
+            pw: Optional[Playwright] = None
+            browser = None
+            try:
+                pw = sync_playwright().start()
+                browser = pw.chromium.launch(
+                    headless=use_headless,
+                    channel=_channel,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                        "--window-size=1280,900",
+                    ],
+                )
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 900},
+                    locale="ko-KR",
+                )
+                page = context.new_page()
+                page.set_default_timeout(30000)
+                page.goto(str(url).strip() or "https://www.google.com/", wait_until="domcontentloaded")
+                safe_print(f"[SMOKE] Playwright Chromium 준비 완료 url={url} headless={use_headless}")
+                page.wait_for_timeout(int(wait_seconds * 1000))
+                self._last_error = {}
+                return True
+            except Exception as e:
+                safe_print(f"[SMOKE] Playwright Chromium 실패: {e!r}")
+                self._last_error = {"code": "SMOKE_CHROMIUM", "message": str(e)}
+                return False
+            finally:
+                try:
+                    if browser is not None:
+                        browser.close()
+                except Exception:
+                    pass
+                try:
+                    if pw is not None:
+                        pw.stop()
+                except Exception:
+                    pass
+
     def get_stats(self) -> Dict[str, int]:
         return dict(self._stats)
 
