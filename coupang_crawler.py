@@ -923,13 +923,13 @@ class CoupangCrawler:
         target = str(url).strip() or "https://www.google.com/"
         with self._io_lock:
             self._smoke_preview_png = None
-        hint_h = (
-            "headless=True (COUPANG_SMOKE_HEADLESS) — OS 창 없음. 캡처·phase로 확인하거나 "
-            "로컬 PC에서 스모크 시 기본값(headless=False)을 쓰세요."
+        hint_h_env = "headless=True (COUPANG_SMOKE_HEADLESS) — OS 창 없음. 캡처·phase로 확인."
+        hint_h_auto = (
+            "headless=True — Linux에 DISPLAY가 없어 자동 headless입니다. "
+            "Railway/Docker에서는 스크린샷·phase로만 확인됩니다."
         )
         hint_v = (
-            "headless=False(스모크 기본) — Playwright Chromium이 별도 창으로 보여야 합니다. "
-            "Railway 등 DISPLAY 없는 Linux에서 기동이 실패하면 COUPANG_SMOKE_HEADLESS=true 로 전환."
+            "headless=False — Playwright Chromium이 별도 창으로 보여야 합니다 (로컬 Windows 등)."
         )
         self._smoke_status_update(
             phase="launching",
@@ -944,15 +944,29 @@ class CoupangCrawler:
         self._sanitize_playwright_browser_env()
         self._log_playwright_preflight()
         _ensure_windows_proactor_policy()
-        # 스모크만 기본 headed(headless=False)로 과정을 눈으로 확인. 서버 전용이면 COUPANG_SMOKE_HEADLESS=true.
+        # env 명시 시 우선. 미설정 시 DISPLAY 없는 Linux는 headed 불가 → _prep_force_headless 와 동일하게 headless.
         _sh = str(os.environ.get("COUPANG_SMOKE_HEADLESS", "")).strip().lower()
         if _sh in {"1", "true", "y", "yes"}:
             use_headless = True
+            _smoke_hint = hint_h_env
         elif _sh in {"0", "false", "n", "no"}:
             use_headless = False
+            if sys.platform != "win32" and not (os.environ.get("DISPLAY") or "").strip():
+                safe_print(
+                    "[SMOKE] COUPANG_SMOKE_HEADLESS=false 이지만 DISPLAY가 없어 headless로 강제합니다."
+                )
+                use_headless = True
+                _smoke_hint = hint_h_auto
+            else:
+                _smoke_hint = hint_v
+        elif self._prep_force_headless():
+            use_headless = True
+            _smoke_hint = hint_h_auto
+            safe_print("[SMOKE] DISPLAY 없음 — 스모크는 headless로 실행합니다.")
         else:
             use_headless = False
-        self._smoke_status_update(headless=use_headless, hint=hint_h if use_headless else hint_v)
+            _smoke_hint = hint_v
+        self._smoke_status_update(headless=use_headless, hint=_smoke_hint)
         _channel = str(os.environ.get("COUPANG_PLAYWRIGHT_CHANNEL", "")).strip() or None
         pw: Optional[Playwright] = None
         browser = None
