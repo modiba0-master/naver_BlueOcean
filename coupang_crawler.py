@@ -746,6 +746,62 @@ class CoupangCrawler:
         except Exception:
             return
 
+    def _accept_google_consent_if_present(self, page: Page) -> None:
+        """
+        Google 첫 진입 시 뜨는 동의 팝업(모두 수락/Accept all)을 1회 수락 시도한다.
+        팝업이 없거나 셀렉터가 바뀐 경우에도 흐름은 계속 진행한다.
+        """
+        try:
+            # 동의 화면에서는 종종 consent.google.com 으로 리다이렉트되므로 짧게 대기
+            page.wait_for_timeout(600)
+            url_lower = str(page.url or "").lower()
+
+            # 1) 메인 문서에서 직접 버튼 탐색
+            candidates = [
+                page.get_by_role("button", name=re.compile(r"모두\s*수락|동의하고\s*계속", re.I)).first,
+                page.get_by_role("button", name=re.compile(r"accept\s*all|i\s*agree", re.I)).first,
+                page.locator("button[aria-label*='모두 수락'], button[aria-label*='Accept all']").first,
+                page.locator("form[action*='consent'] button, form[action*='consent'] input[type='submit']").first,
+            ]
+            for btn in candidates:
+                try:
+                    btn.wait_for(state="visible", timeout=1800)
+                    btn.click(timeout=2500)
+                    safe_print("[SMOKE] Google 동의 팝업 수락 완료(메인 문서)")
+                    page.wait_for_timeout(500)
+                    return
+                except Exception:
+                    continue
+
+            # 2) iframe 내부 동의 버튼 탐색
+            for fr in page.frames:
+                f_url = str(fr.url or "").lower()
+                if "consent" not in f_url and "google" not in f_url and "intro" not in f_url:
+                    continue
+                for sel in (
+                    "button:has-text('모두 수락')",
+                    "button:has-text('동의하고 계속')",
+                    "button:has-text('Accept all')",
+                    "button:has-text('I agree')",
+                    "form[action*='consent'] button",
+                    "form[action*='consent'] input[type='submit']",
+                ):
+                    try:
+                        b = fr.locator(sel).first
+                        if b.count() > 0:
+                            b.click(timeout=2500)
+                            safe_print("[SMOKE] Google 동의 팝업 수락 완료(iframe)")
+                            page.wait_for_timeout(500)
+                            return
+                    except Exception:
+                        continue
+
+            # 동의 도메인인데 버튼을 못 찾았으면 흔적만 남김
+            if "consent.google.com" in url_lower:
+                safe_print("[SMOKE] Google 동의 화면 감지했으나 수락 버튼을 찾지 못했습니다.")
+        except Exception as e:
+            safe_print(f"[SMOKE] Google 동의 팝업 처리 중 예외(무시): {e!r}")
+
     def _session_headers_from_page(self, page: Page) -> Dict[str, str]:
         try:
             ua = str(page.evaluate("() => navigator.userAgent"))
@@ -1183,6 +1239,7 @@ class CoupangCrawler:
             google_query = "쿠팡" if _raw_sq is None else str(_raw_sq).strip()
             if google_query:
                 try:
+                    self._accept_google_consent_if_present(page)
                     self._smoke_status_update(
                         phase="google_search_input",
                         hint=f"구글 검색창에 입력 중: {google_query!r} (한 글자씩 표시)",
