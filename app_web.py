@@ -2,6 +2,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 import webbrowser
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -23,6 +24,7 @@ from db import query_market_score_rows
 from report_format import report_to_excel_bytes
 
 _GOOGLE_HOME_URL = "https://www.google.com/"
+_PLAYWRIGHT_SMOKE_MAX_SECONDS = 300.0
 
 
 def _chrome_exe_candidates_windows() -> List[str]:
@@ -485,8 +487,9 @@ def run() -> None:
         st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시합니다.")
         st.caption(
             "**접속 준비 확인(홈)** 은 설치형 Chrome/기본 브라우저로 구글만 엽니다. "
-            "**Playwright Chromium 확인** 은 대시보드에 끼워 넣지 않고 Playwright 번들 Chromium을 **별도 창**으로 "
-            "연 뒤 잠시 유지합니다(서버에 DISPLAY 없으면 headless로 기동만 확인). "
+            "**Playwright Chromium 확인** 은 번들 Chromium을 **별도 창**으로 연 뒤 최대 "
+            f"{int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초 유지합니다. **[강제 종료]** 로 그 전에 닫을 수 있습니다. "
+            "(서버에 DISPLAY 없으면 headless로 기동만 확인.) "
             "**접속 준비 확인(검색창)** 은 기존처럼 쿠팡 준비 세션입니다."
         )
 
@@ -510,6 +513,17 @@ def run() -> None:
                 width='stretch',
             )
 
+        prep_pw_stop_clicked = st.button(
+            "Playwright Chromium 강제 종료",
+            key="coupang_prep_pw_smoke_stop_btn",
+            width='stretch',
+            disabled=not tool.coupang_crawler.is_smoke_playwright_running(),
+        )
+        if tool.coupang_crawler.is_smoke_playwright_running():
+            st.caption(
+                f"스모크 Chromium 실행 중 — 최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초 유지 또는 위 버튼으로 즉시 종료."
+            )
+
         if prep_home_clicked:
             with st.spinner("브라우저에서 구글 검색 화면을 여는 중입니다..."):
                 ok = open_google_home_in_desktop_browser()
@@ -523,16 +537,29 @@ def run() -> None:
             }
 
         if prep_pw_smoke_clicked:
-            with st.spinner("Playwright Chromium을 별도 창으로 여는 중입니다..."):
-                ok = tool.coupang_crawler.smoke_open_playwright_chromium_window(
+            with st.spinner("Playwright Chromium 백그라운드 시작 중..."):
+                ok_start = tool.coupang_crawler.smoke_open_playwright_chromium_window(
                     url=_GOOGLE_HOME_URL,
-                    wait_seconds=35.0,
+                    wait_seconds=_PLAYWRIGHT_SMOKE_MAX_SECONDS,
                 )
+                time.sleep(0.35)
+                ok = bool(ok_start and tool.coupang_crawler.is_smoke_playwright_running())
             st.session_state["coupang_prep_status"] = {
                 "mode": "playwright_chromium_smoke",
                 "ok": bool(ok),
                 "stats": tool.coupang_crawler.get_stats(),
                 "last_error": tool.coupang_crawler.get_last_error(),
+                "note": f"별도 창 유지 최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초, 강제 종료 버튼으로 조기 종료 가능.",
+            }
+
+        if prep_pw_stop_clicked:
+            tool.coupang_crawler.stop_smoke_playwright_chromium_window()
+            st.session_state["coupang_prep_status"] = {
+                "mode": "playwright_chromium_smoke_stop",
+                "ok": True,
+                "stats": tool.coupang_crawler.get_stats(),
+                "last_error": {},
+                "note": "스모크 Chromium 종료 요청을 보냈습니다.",
             }
 
         if prep_search_clicked:
@@ -555,6 +582,8 @@ def run() -> None:
             st.caption(f"prep_stats={prep_status.get('stats', {})}")
             if prep_status.get("last_error"):
                 st.error(f"prep_last_error={prep_status.get('last_error')}")
+            if prep_status.get("note"):
+                st.caption(str(prep_status.get("note")))
 
         c_input_col1, c_input_col2 = st.columns([3, 1])
         with c_input_col1:

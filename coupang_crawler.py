@@ -107,6 +107,8 @@ class CoupangCrawler:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._io_lock = threading.RLock()
+        self._smoke_thread: Optional[threading.Thread] = None
+        self._smoke_stop_event: Optional[threading.Event] = None
         env_raw = str(os.environ.get("COUPANG_HEADLESS", "")).strip().lower()
         if env_raw in {"0", "false", "n", "no"}:
             self._headless = False
@@ -776,63 +778,124 @@ class CoupangCrawler:
             return self._result_with_reason(reason)
         return self._result_with_reason("CRAWL_FAILED")
 
+    def is_smoke_playwright_running(self) -> bool:
+        with self._io_lock:
+            t = self._smoke_thread
+        return t is not None and t.is_alive()
+
+    def stop_smoke_playwright_chromium_window(self, join_timeout: float = 20.0) -> None:
+        """백그라운드 스모크 Chromium을 즉시 닫도록 신호를 보낸 뒤 스레드 종료를 기다린다."""
+        thr: Optional[threading.Thread] = None
+        with self._io_lock:
+            ev = self._smoke_stop_event
+            thr = self._smoke_thread
+        if ev is not None:
+            ev.set()
+        if thr is not None:
+            thr.join(timeout=max(1.0, float(join_timeout)))
+        with self._io_lock:
+            self._smoke_thread = None
+            self._smoke_stop_event = None
+
+    def _run_smoke_worker(self, url: str, max_wait_seconds: float, stop_event: threading.Event) -> None:
+        """별도 스레드에서 실행. persistent 크롤 세션과 무관한 ephemeral Chromium."""
+        self._sanitize_playwright_browser_env()
+        self._log_playwright_preflight()
+        _ensure_windows_proactor_policy()
+        use_headless = self._prep_force_headless()
+        _channel = str(os.environ.get("COUPANG_PLAYWRIGHT_CHANNEL", "")).strip() or None
+        pw: Optional[Playwright] = None
+        browser = None
+        try:
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(
+                headless=use_headless,
+                channel=_channel,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1280,900",
+                ],
+            )
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="ko-KR",
+            )
+            page = context.new_page()
+            page.set_default_timeout(30000)
+            page.goto(str(url).strip() or "https://www.google.com/", wait_until="domcontentloaded")
+            safe_print(f"[SMOKE] Playwright Chromium 준비 완료 url={url} headless={use_headless}")
+            with self._io_lock:
+                self._last_error = {}
+            deadline = time.monotonic() + float(max_wait_seconds)
+            poll = 0.5
+            while time.monotonic() < deadline:
+                if stop_event.is_set():
+                    safe_print("[SMOKE] 사용자 강제 종료 신호 수신.")
+                    break
+                time.sleep(poll)
+            safe_print("[SMOKE] 유지 시간 종료 또는 중지에 따라 브라우저를 닫습니다.")
+        except Exception as e:
+            safe_print(f"[SMOKE] Playwright Chromium 실패: {e!r}")
+            with self._io_lock:
+                self._last_error = {"code": "SMOKE_CHROMIUM", "message": str(e)}
+        finally:
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+            try:
+                if pw is not None:
+                    pw.stop()
+            except Exception:
+                pass
+            with self._io_lock:
+                if self._smoke_thread is threading.current_thread():
+                    self._smoke_thread = None
+                    self._smoke_stop_event = None
+
     def smoke_open_playwright_chromium_window(
         self,
         url: str = "https://www.google.com/",
-        wait_seconds: float = 35.0,
+        wait_seconds: float = 300.0,
     ) -> bool:
         """
-        크롤러의 persistent 세션(_page/_context)과 별도로 Playwright 번들 Chromium만 연다.
-        Streamlit 안에 임베드하지 않고 OS의 별도 창으로 표시(headless 불가 환경에서는 창 없이 기동만 확인).
+        크롤러 persistent 세션과 별도로 Playwright 번들 Chromium을 별도 창으로 연다.
+        Streamlit 요청을 막지 않도록 백그라운드 스레드에서 최대 wait_seconds 동안 유지한다.
+        대시보드의 강제 종료 버튼은 stop_smoke_playwright_chromium_window() 로 즉시 닫을 수 있다.
         """
-        wait_seconds = max(5.0, float(wait_seconds))
+        return self.start_smoke_playwright_chromium_window(url=url, max_wait_seconds=wait_seconds)
+
+    def start_smoke_playwright_chromium_window(
+        self,
+        url: str = "https://www.google.com/",
+        max_wait_seconds: float = 300.0,
+    ) -> bool:
+        max_wait_seconds = max(5.0, float(max_wait_seconds))
+        old_thr: Optional[threading.Thread] = None
+        old_ev: Optional[threading.Event] = None
         with self._io_lock:
-            self._sanitize_playwright_browser_env()
-            self._log_playwright_preflight()
-            _ensure_windows_proactor_policy()
-            use_headless = self._prep_force_headless()
-            _channel = str(os.environ.get("COUPANG_PLAYWRIGHT_CHANNEL", "")).strip() or None
-            pw: Optional[Playwright] = None
-            browser = None
-            try:
-                pw = sync_playwright().start()
-                browser = pw.chromium.launch(
-                    headless=use_headless,
-                    channel=_channel,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-blink-features=AutomationControlled",
-                        "--window-size=1280,900",
-                    ],
-                )
-                context = browser.new_context(
-                    viewport={"width": 1280, "height": 900},
-                    locale="ko-KR",
-                )
-                page = context.new_page()
-                page.set_default_timeout(30000)
-                page.goto(str(url).strip() or "https://www.google.com/", wait_until="domcontentloaded")
-                safe_print(f"[SMOKE] Playwright Chromium 준비 완료 url={url} headless={use_headless}")
-                page.wait_for_timeout(int(wait_seconds * 1000))
-                self._last_error = {}
-                return True
-            except Exception as e:
-                safe_print(f"[SMOKE] Playwright Chromium 실패: {e!r}")
-                self._last_error = {"code": "SMOKE_CHROMIUM", "message": str(e)}
-                return False
-            finally:
-                try:
-                    if browser is not None:
-                        browser.close()
-                except Exception:
-                    pass
-                try:
-                    if pw is not None:
-                        pw.stop()
-                except Exception:
-                    pass
+            old_thr = self._smoke_thread
+            old_ev = self._smoke_stop_event
+            self._smoke_stop_event = threading.Event()
+            stop_ev = self._smoke_stop_event
+            self._smoke_thread = None
+        if old_ev is not None:
+            old_ev.set()
+        if old_thr is not None:
+            old_thr.join(timeout=20.0)
+
+        def runner() -> None:
+            self._run_smoke_worker(url, max_wait_seconds, stop_ev)
+
+        t = threading.Thread(target=runner, name="pw-smoke-chromium", daemon=True)
+        with self._io_lock:
+            self._smoke_thread = t
+        t.start()
+        return True
 
     def get_stats(self) -> Dict[str, int]:
         return dict(self._stats)
@@ -841,6 +904,10 @@ class CoupangCrawler:
         return dict(self._last_error)
 
     def close(self) -> None:
+        try:
+            self.stop_smoke_playwright_chromium_window(join_timeout=15.0)
+        except Exception:
+            pass
         with self._io_lock:
             if self._page is not None:
                 try:
