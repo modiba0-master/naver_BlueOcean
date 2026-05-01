@@ -542,14 +542,34 @@ def run() -> None:
                     url=_GOOGLE_HOME_URL,
                     wait_seconds=_PLAYWRIGHT_SMOKE_MAX_SECONDS,
                 )
-                time.sleep(0.35)
-                ok = bool(ok_start and tool.coupang_crawler.is_smoke_playwright_running())
+                ok = False
+                if ok_start:
+                    deadline_poll = time.monotonic() + 10.0
+                    while time.monotonic() < deadline_poll:
+                        st_smoke = tool.coupang_crawler.get_smoke_playwright_status()
+                        if st_smoke.get("phase") == "opened":
+                            ok = True
+                            break
+                        if st_smoke.get("phase") == "failed":
+                            ok = False
+                            break
+                        if not tool.coupang_crawler.is_smoke_playwright_running():
+                            break
+                        time.sleep(0.2)
+                    if not ok and tool.coupang_crawler.is_smoke_playwright_running():
+                        st_smoke = tool.coupang_crawler.get_smoke_playwright_status()
+                        ph = str(st_smoke.get("phase") or "")
+                        if ph not in ("failed", "idle", "closed", "queued"):
+                            ok = True
             st.session_state["coupang_prep_status"] = {
                 "mode": "playwright_chromium_smoke",
                 "ok": bool(ok),
                 "stats": tool.coupang_crawler.get_stats(),
                 "last_error": tool.coupang_crawler.get_last_error(),
-                "note": f"별도 창 유지 최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초, 강제 종료 버튼으로 조기 종료 가능.",
+                "note": (
+                    f"별도 창 유지 최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초. "
+                    "아래 **스모크 상태** 패널에서 phase·스크린샷으로 창/로드 여부를 확인하세요."
+                ),
             }
 
         if prep_pw_stop_clicked:
@@ -584,6 +604,24 @@ def run() -> None:
                 st.error(f"prep_last_error={prep_status.get('last_error')}")
             if prep_status.get("note"):
                 st.caption(str(prep_status.get("note")))
+
+        smpv = tool.coupang_crawler.get_smoke_playwright_status()
+        if str(smpv.get("phase") or "idle") != "idle":
+            with st.expander(
+                "Playwright Chromium 스모크 — 창·로드 확인 (phase / 스크린샷)",
+                expanded=bool(smpv.get("thread_alive")),
+            ):
+                view = {k: v for k, v in smpv.items() if k != "preview_png"}
+                st.json(view)
+                prev = smpv.get("preview_png")
+                if prev:
+                    st.image(
+                        prev,
+                        caption="Chromium 첫 로드 직후 스크린샷 (headless 서버에서도 이 이미지로 확인)",
+                        use_container_width=True,
+                    )
+                elif smpv.get("thread_alive") and smpv.get("phase") not in ("failed", "closed"):
+                    st.caption("스크린샷 대기 중이거나 로드가 느립니다. 잠시 후 **Rerun / 새로고침**으로 다시 확인하세요.")
 
         c_input_col1, c_input_col2 = st.columns([3, 1])
         with c_input_col1:

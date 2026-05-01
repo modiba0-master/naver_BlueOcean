@@ -109,6 +109,18 @@ class CoupangCrawler:
         self._io_lock = threading.RLock()
         self._smoke_thread: Optional[threading.Thread] = None
         self._smoke_stop_event: Optional[threading.Event] = None
+        self._smoke_status: Dict[str, Any] = {
+            "phase": "idle",
+            "headless": None,
+            "target_url": "",
+            "page_url": "",
+            "page_title": "",
+            "opened_at": None,
+            "closed_at": None,
+            "hint": "",
+            "error": "",
+        }
+        self._smoke_preview_png: Optional[bytes] = None
         env_raw = str(os.environ.get("COUPANG_HEADLESS", "")).strip().lower()
         if env_raw in {"0", "false", "n", "no"}:
             self._headless = False
@@ -133,6 +145,20 @@ class CoupangCrawler:
         os.makedirs(self._prep_user_data_dir, exist_ok=True)
         if not self._chrome_profile:
             self._chrome_profile = "Default"
+
+    def _smoke_status_update(self, **kwargs: Any) -> None:
+        with self._io_lock:
+            self._smoke_status = {**self._smoke_status, **kwargs}
+
+    def get_smoke_playwright_status(self) -> Dict[str, Any]:
+        """대시보드에서 스모크 Chromium 진행 여부 확인용(phase·URL·캡처 등)."""
+        with self._io_lock:
+            out = dict(self._smoke_status)
+            png = self._smoke_preview_png
+        out["thread_alive"] = self.is_smoke_playwright_running()
+        if png:
+            out["preview_png"] = png
+        return out
 
     def _sanitize_playwright_browser_env(self) -> None:
         """Railway 리눅스 경로를 Windows 로컬에 복사하면 Chromium을 못 찾으므로 무효 경로는 제거."""
@@ -799,15 +825,35 @@ class CoupangCrawler:
 
     def _run_smoke_worker(self, url: str, max_wait_seconds: float, stop_event: threading.Event) -> None:
         """별도 스레드에서 실행. persistent 크롤 세션과 무관한 ephemeral Chromium."""
+        target = str(url).strip() or "https://www.google.com/"
+        with self._io_lock:
+            self._smoke_preview_png = None
+        hint_h = (
+            "headless=True — OS 창은 없고, 아래 대시보드 캡처·phase로만 확인됩니다. (Railway/Docker 일반)"
+        )
+        hint_v = "headless=False — Playwright Chromium 별도 창이 데스크톱에 떠야 합니다."
+        self._smoke_status_update(
+            phase="launching",
+            target_url=target,
+            page_url="",
+            page_title="",
+            opened_at=None,
+            closed_at=None,
+            error="",
+            hint="브라우저 기동 중…",
+        )
         self._sanitize_playwright_browser_env()
         self._log_playwright_preflight()
         _ensure_windows_proactor_policy()
         use_headless = self._prep_force_headless()
+        self._smoke_status_update(headless=use_headless, hint=hint_h if use_headless else hint_v)
         _channel = str(os.environ.get("COUPANG_PLAYWRIGHT_CHANNEL", "")).strip() or None
         pw: Optional[Playwright] = None
         browser = None
+        failed = False
         try:
             pw = sync_playwright().start()
+            self._smoke_status_update(phase="playwright_started")
             browser = pw.chromium.launch(
                 headless=use_headless,
                 channel=_channel,
@@ -819,26 +865,52 @@ class CoupangCrawler:
                     "--window-size=1280,900",
                 ],
             )
+            self._smoke_status_update(phase="chromium_launched")
             context = browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 locale="ko-KR",
             )
             page = context.new_page()
             page.set_default_timeout(30000)
-            page.goto(str(url).strip() or "https://www.google.com/", wait_until="domcontentloaded")
-            safe_print(f"[SMOKE] Playwright Chromium 준비 완료 url={url} headless={use_headless}")
+            self._smoke_status_update(phase="navigating")
+            page.goto(target, wait_until="domcontentloaded")
+            safe_print(f"[SMOKE] Playwright Chromium 준비 완료 url={target} headless={use_headless}")
+            try:
+                png = page.screenshot(type="png", full_page=False)
+            except Exception as cap_err:
+                safe_print(f"[SMOKE] 스크린샷 생략: {cap_err!r}")
+                png = None
+            with self._io_lock:
+                self._smoke_preview_png = png
+            try:
+                ptitle = page.title()
+                purl = page.url
+            except Exception:
+                ptitle = ""
+                purl = ""
+            self._smoke_status_update(
+                phase="opened",
+                page_url=purl,
+                page_title=ptitle,
+                opened_at=time.time(),
+                hint="첫 로드 완료. 유지 시간 동안 창을 확인하거나 대시보드 캡처를 참고하세요.",
+            )
             with self._io_lock:
                 self._last_error = {}
             deadline = time.monotonic() + float(max_wait_seconds)
             poll = 0.5
+            self._smoke_status_update(phase="holding")
             while time.monotonic() < deadline:
                 if stop_event.is_set():
                     safe_print("[SMOKE] 사용자 강제 종료 신호 수신.")
+                    self._smoke_status_update(hint="강제 종료 신호 수신, 브라우저를 닫는 중…")
                     break
                 time.sleep(poll)
             safe_print("[SMOKE] 유지 시간 종료 또는 중지에 따라 브라우저를 닫습니다.")
         except Exception as e:
+            failed = True
             safe_print(f"[SMOKE] Playwright Chromium 실패: {e!r}")
+            self._smoke_status_update(phase="failed", error=str(e), closed_at=time.time())
             with self._io_lock:
                 self._last_error = {"code": "SMOKE_CHROMIUM", "message": str(e)}
         finally:
@@ -852,6 +924,8 @@ class CoupangCrawler:
                     pw.stop()
             except Exception:
                 pass
+            if not failed:
+                self._smoke_status_update(phase="closed", closed_at=time.time())
             with self._io_lock:
                 if self._smoke_thread is threading.current_thread():
                     self._smoke_thread = None
@@ -880,6 +954,7 @@ class CoupangCrawler:
         with self._io_lock:
             old_thr = self._smoke_thread
             old_ev = self._smoke_stop_event
+            self._smoke_preview_png = None
             self._smoke_stop_event = threading.Event()
             stop_ev = self._smoke_stop_event
             self._smoke_thread = None
@@ -887,6 +962,18 @@ class CoupangCrawler:
             old_ev.set()
         if old_thr is not None:
             old_thr.join(timeout=20.0)
+
+        self._smoke_status_update(
+            phase="queued",
+            target_url=str(url).strip() or "https://www.google.com/",
+            headless=None,
+            page_url="",
+            page_title="",
+            opened_at=None,
+            closed_at=None,
+            error="",
+            hint="스모크 스레드를 시작합니다.",
+        )
 
         def runner() -> None:
             self._run_smoke_worker(url, max_wait_seconds, stop_ev)
