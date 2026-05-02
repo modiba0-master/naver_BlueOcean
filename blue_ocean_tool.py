@@ -18,6 +18,7 @@ import hashlib
 import base64
 import json
 import math
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from report_format import finalize_analysis_dataframe
@@ -222,8 +223,11 @@ class BlueOceanTool:
             "yes",
             "on",
         }
+        # 안전 롤아웃: 0=기존, 1=의도 분류, 2=판매력/경쟁도/시즌성, 3=최종 재가중치
+        self.sourcing_rollout_stage = self._read_sourcing_rollout_stage()
         self._apply_db_env_from_config()
         self.ai_pipeline = AIPipeline(base_dir=os.path.dirname(os.path.abspath(__file__)))
+        self._last_analysis_detail_df = pd.DataFrame()
         
         # 출력 폴더 생성
         if not os.path.exists(self.output_dir):
@@ -254,6 +258,121 @@ class BlueOceanTool:
         """
         apply_db_cfg_dict_to_env(self.config.get("database") or {})
 
+    def get_last_analysis_detail_df(self) -> pd.DataFrame:
+        """실행 직후의 상세 분석 DataFrame(확장 컬럼 포함). 없으면 빈 DataFrame."""
+        if isinstance(self._last_analysis_detail_df, pd.DataFrame):
+            return self._last_analysis_detail_df.copy()
+        return pd.DataFrame()
+
+    def _read_sourcing_rollout_stage(self) -> int:
+        settings = self.config.get("settings", {}) if isinstance(self.config, dict) else {}
+        raw = (
+            os.getenv("BLUEOCEAN_SOURCING_STAGE")
+            or settings.get("sourcing_rollout_stage")
+            or "0"
+        )
+        try:
+            return max(0, min(3, int(str(raw).strip())))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _parse_number_from_text(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        s = str(value).strip().replace(",", "")
+        if not s:
+            return None
+        m = re.search(r"(-?\d+(?:\.\d+)?)", s)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    def classify_keyword_intent(self, keyword: str) -> str:
+        text = str(keyword or "").strip().lower()
+        if not text:
+            return "정보형"
+        if any(k in text for k in ("추천", "비교", "순위")):
+            return "탐색형"
+        if any(k in text for k in ("구매", "가격", "할인")):
+            return "구매형"
+        return "정보형"
+
+    def detect_seasonality(self, trend_series: List[float]) -> str:
+        vals = [float(v) for v in trend_series if self._safe_float(v, 0.0) > 0]
+        if len(vals) < 4:
+            return "steady"
+        peak = max(vals)
+        avg = sum(vals) / len(vals)
+        trough = min(vals)
+        recent = sum(vals[-3:]) / max(1, len(vals[-3:]))
+        prev = sum(vals[:-3]) / max(1, len(vals[:-3])) if len(vals) > 3 else avg
+        if avg > 0 and peak / avg >= 1.6 and trough / avg <= 0.7:
+            return "seasonal"
+        if prev > 0 and recent / prev >= 1.25:
+            return "trend"
+        return "steady"
+
+    def _extract_price_values(self, items: List[Dict[str, Any]]) -> List[float]:
+        out: List[float] = []
+        for it in items:
+            n = self._parse_number_from_text(it.get("price"))
+            if n is not None and n > 0:
+                out.append(float(n))
+        return out
+
+    def _extract_review_values(self, items: List[Dict[str, Any]]) -> List[float]:
+        out: List[float] = []
+        for it in items:
+            n = self._parse_number_from_text(it.get("review_count"))
+            if n is not None and n >= 0:
+                out.append(float(n))
+        return out
+
+    def _compute_sales_power(self, profile: Dict[str, Any]) -> float:
+        avg_reviews = float(profile.get("avg_reviews") or 0.0)
+        avg_price = float(profile.get("avg_price") or 0.0)
+        review_growth_proxy = float(profile.get("review_growth_proxy") or 0.0)
+        review_distribution = float(profile.get("review_distribution") or 0.0)
+        price_stability = float(profile.get("price_stability") or 0.0)
+
+        review_price = 0.0
+        if avg_price > 0:
+            review_price = math.log1p(max(0.0, avg_reviews)) / math.log1p(max(1.0, avg_price))
+
+        sales_power = (
+            min(100.0, review_price * 42.0)
+            + min(100.0, review_growth_proxy * 35.0)
+            + min(100.0, review_distribution * 15.0)
+            + min(100.0, price_stability * 8.0)
+        )
+        return round(max(0.0, min(100.0, sales_power)), 2)
+
+    def _compute_competition_score_advanced(
+        self,
+        *,
+        product_count: int,
+        ad_ratio: float,
+        brand_share: float,
+        new_ratio: float,
+    ) -> float:
+        base = max(1.0, math.log1p(max(0, int(product_count))))
+        ad_factor = 1.0 + max(0.0, min(1.0, ad_ratio)) * 0.8
+        brand_factor = 1.0 + max(0.0, min(1.0, brand_share)) * 0.6
+        # 신상품 비율이 높으면 진입 여지로 보고 경쟁점수(페널티)를 일부 완화
+        new_factor = 1.0 - max(0.0, min(1.0, new_ratio)) * 0.25
+        return max(1.0, base * ad_factor * brand_factor * new_factor)
+
     def get_monthly_trends(self, keyword, start_date, end_date):
         """요청된 기간의 월별 트렌드 지수 수집"""
         url = "https://openapi.naver.com/v1/datalab/shopping/category/keywords"
@@ -272,14 +391,20 @@ class BlueOceanTool:
             return {}
         except: return {}
 
-    def get_product_info(self, keyword) -> tuple[int, str]:
-        url = f"https://openapi.naver.com/v1/search/shop.json?query={keyword}&display=1"
+    def get_product_info(self, keyword, include_competition: bool = False):
+        display = 30 if include_competition else 1
+        url = f"https://openapi.naver.com/v1/search/shop.json?query={keyword}&display={display}"
         try:
             res = requests.get(url, headers=self.open_headers)
             if res.status_code == 200:
                 payload = res.json()
                 total = int(payload.get("total", 0) or 0)
                 items = payload.get("items", []) or []
+                competition_meta = {
+                    "ad_ratio": 0.0,
+                    "brand_share": 0.0,
+                    "new_ratio": 0.0,
+                }
                 if items:
                     it = items[0]
                     cats = [
@@ -289,26 +414,102 @@ class BlueOceanTool:
                         str(it.get("category4", "")).strip(),
                     ]
                     cat_path = " > ".join([c for c in cats if c])
+                    if include_competition:
+                        ad_like = 0
+                        brand_counter: Counter[str] = Counter()
+                        new_like = 0
+                        for row in items:
+                            ptype = str(row.get("productType", "")).strip()
+                            ad_token = str(row.get("adId", "") or row.get("adcrUrl", "")).strip()
+                            if ptype in {"2", "3", "4"} or ad_token:
+                                ad_like += 1
+                            brand = (
+                                str(row.get("brand", "")).strip()
+                                or str(row.get("maker", "")).strip()
+                                or str(row.get("mallName", "")).strip()
+                            )
+                            if brand:
+                                brand_counter[brand.lower()] += 1
+                            rc = self._parse_number_from_text(
+                                row.get("reviewCount")
+                                or row.get("review_count")
+                                or row.get("review")
+                            )
+                            if rc is not None and rc <= 20:
+                                new_like += 1
+                        n = max(1, len(items))
+                        competition_meta = {
+                            "ad_ratio": ad_like / n,
+                            "brand_share": (brand_counter.most_common(1)[0][1] / n) if brand_counter else 0.0,
+                            "new_ratio": new_like / n,
+                        }
                 else:
                     cat_path = ""
+                if include_competition:
+                    return total, cat_path, competition_meta
                 return total, cat_path
+            if include_competition:
+                return 0, "", {"ad_ratio": 0.0, "brand_share": 0.0, "new_ratio": 0.0}
             return 0, ""
         except Exception:
+            if include_competition:
+                return 0, "", {"ad_ratio": 0.0, "brand_share": 0.0, "new_ratio": 0.0}
             return 0, ""
 
     def get_product_count(self, keyword):
         total, _ = self.get_product_info(keyword)
         return total
 
-    def get_coupang_top10_stats(self, keyword: str) -> tuple[Optional[float], Optional[float]]:
+    def get_coupang_top10_stats(self, keyword: str, include_profile: bool = False):
         try:
             data = self.coupang_crawler.crawl_coupang(keyword)
             avg_reviews = float(data.get("avg_reviews", 0.0) or 0.0)
             avg_price = float(data.get("avg_price", 0.0) or 0.0)
+            profile = {
+                "avg_reviews": avg_reviews,
+                "avg_price": avg_price,
+                "review_growth_proxy": 0.0,
+                "review_distribution": 0.0,
+                "price_stability": 0.0,
+                "sales_power": 0.0,
+            }
+            if include_profile:
+                items = data.get("top10_items") or []
+                review_values = self._extract_review_values(items)
+                price_values = self._extract_price_values(items)
+                if review_values:
+                    head_n = max(1, len(review_values) // 3)
+                    recent_proxy = sum(review_values[:head_n]) / head_n
+                    total_avg = sum(review_values) / len(review_values)
+                    review_growth_proxy = (recent_proxy / total_avg) if total_avg > 0 else 0.0
+                    top_share = max(review_values) / max(1.0, sum(review_values))
+                    review_distribution = 1.0 - min(1.0, top_share)
+                    profile["review_growth_proxy"] = max(0.0, min(2.0, review_growth_proxy))
+                    profile["review_distribution"] = max(0.0, min(1.0, review_distribution))
+                if len(price_values) >= 2:
+                    p_avg = sum(price_values) / len(price_values)
+                    variance = sum((p - p_avg) ** 2 for p in price_values) / len(price_values)
+                    stdev = math.sqrt(max(0.0, variance))
+                    cv = stdev / p_avg if p_avg > 0 else 1.0
+                    profile["price_stability"] = max(0.0, min(1.0, 1.0 - cv))
+                profile["sales_power"] = self._compute_sales_power(profile)
             if avg_reviews <= 0 or avg_price <= 0:
+                if include_profile:
+                    return None, None, profile
                 return None, None
+            if include_profile:
+                return avg_reviews, avg_price, profile
             return avg_reviews, avg_price
         except Exception:
+            if include_profile:
+                return None, None, {
+                    "avg_reviews": 0.0,
+                    "avg_price": 0.0,
+                    "review_growth_proxy": 0.0,
+                    "review_distribution": 0.0,
+                    "price_stability": 0.0,
+                    "sales_power": 0.0,
+                }
             return None, None
 
     def _strategy_text(self, blue_ocean_score: float) -> str:
@@ -377,23 +578,26 @@ class BlueOceanTool:
     ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         for r in all_results:
-            opportunity_score = float(r.get("블루오션 점수", 0.0) or 0.0)
-            commercial_score = self._compute_commercial_score(
-                monthly_click_est=float(r.get("월평균 클릭수(추정)", 0.0) or 0.0),
-                avg_ctr_pct=float(str(r.get("평균 클릭율(CTR)", "0")).replace("%", "") or 0.0),
-                top10_avg_reviews=(
-                    float(r.get("쿠팡 Top10 평균리뷰수"))
-                    if r.get("쿠팡 Top10 평균리뷰수") is not None
-                    else None
-                ),
-                top10_avg_price=(
-                    float(r.get("쿠팡 Top10 평균가격"))
-                    if r.get("쿠팡 Top10 평균가격") is not None
-                    else None
-                ),
-                product_count=int(r.get("상품수", 0) or 0),
-            )
-            final_score = round(opportunity_score * 0.45 + commercial_score * 0.55, 2)
+            opportunity_score = float(r.get("기회 점수", r.get("블루오션 점수", 0.0)) or 0.0)
+            if r.get("판매가치 점수") is not None:
+                commercial_score = float(r.get("판매가치 점수") or 0.0)
+            else:
+                commercial_score = self._compute_commercial_score(
+                    monthly_click_est=float(r.get("월평균 클릭수(추정)", 0.0) or 0.0),
+                    avg_ctr_pct=float(str(r.get("평균 클릭율(CTR)", "0")).replace("%", "") or 0.0),
+                    top10_avg_reviews=(
+                        float(r.get("쿠팡 Top10 평균리뷰수"))
+                        if r.get("쿠팡 Top10 평균리뷰수") is not None
+                        else None
+                    ),
+                    top10_avg_price=(
+                        float(r.get("쿠팡 Top10 평균가격"))
+                        if r.get("쿠팡 Top10 평균가격") is not None
+                        else None
+                    ),
+                    product_count=int(r.get("상품수", 0) or 0),
+                )
+            final_score = float(r.get("최종 점수", round(opportunity_score * 0.45 + commercial_score * 0.55, 2)) or 0.0)
             decision_band = self._decision_band(final_score)
             rows.append(
                 {
@@ -622,6 +826,8 @@ class BlueOceanTool:
         trends_by_keyword: Dict[str, Dict[str, Dict[str, float]]] = {}
         mode = str(analysis_mode or "precise").strip().lower()
         is_fast_mode = mode in {"fast", "quick", "빠른", "빠른모드"}
+        rollout_stage = int(self.sourcing_rollout_stage)
+        log(f"🧭 소싱 알고리즘 롤아웃 단계: stage={rollout_stage}")
         deep_limit = 20 if is_fast_mode else 60
         trend_limit = 20
         cache_ttl_hours = 24
@@ -720,6 +926,10 @@ class BlueOceanTool:
                 demand_score = 0.0
                 conversion_score = 0.0
                 competition_score = 1.0
+                intent = self.classify_keyword_intent(kw) if rollout_stage >= 1 else "정보형"
+                season_type = "steady"
+                competition_meta = {"ad_ratio": 0.0, "brand_share": 0.0, "new_ratio": 0.0}
+                sales_profile = {"sales_power": 0.0}
                 if self.db_enabled and query_recent_keyword_cache is not None:
                     try:
                         cache_hit = query_recent_keyword_cache(
@@ -736,7 +946,15 @@ class BlueOceanTool:
                     avg_clk = float(cache_hit.get("monthly_click_est", 0.0))
                     avg_ctr = float(cache_hit.get("avg_ctr_pct", 0.0))
                     prod_count = int(cache_hit.get("product_count", 0))
-                    competition_score = max(1.0, math.log1p(max(0, prod_count)))
+                    if rollout_stage >= 2:
+                        competition_score = self._compute_competition_score_advanced(
+                            product_count=prod_count,
+                            ad_ratio=0.0,
+                            brand_share=0.0,
+                            new_ratio=0.0,
+                        )
+                    else:
+                        competition_score = max(1.0, math.log1p(max(0, prod_count)))
                     demand_score = math.log1p(max(0.0, avg_qc))
                     conversion_score = max(0.1, math.log1p(max(0.0, avg_clk)) * (1.0 + max(0.0, avg_ctr) / 100.0))
                     raw_score = (demand_score * conversion_score / competition_score) * 100.0
@@ -749,10 +967,15 @@ class BlueOceanTool:
                             for _, v in sorted(kw_trends.items(), key=lambda x: x[0])
                         ]
                         trend_score = self._compute_growth_factor(trend_vols) if trend_vols else 1.0
+                        if rollout_stage >= 2:
+                            season_type = self.detect_seasonality(trend_vols)
                         trends_by_keyword[kw] = kw_trends
                 else:
                     # 쇼핑 상품 수/카테고리 조회
-                    prod_count, kw_category = cached_product_info(kw)
+                    if rollout_stage >= 2:
+                        prod_count, kw_category, competition_meta = self.get_product_info(kw, include_competition=True)
+                    else:
+                        prod_count, kw_category = cached_product_info(kw)
                     time.sleep(0.02)
 
                     # 주제어 기반이 아닌, 실행 중 새롭게 탐색된 카테고리를 우선 기준으로 축적
@@ -781,7 +1004,16 @@ class BlueOceanTool:
 
                         # 블루오션 핵심: 저경쟁(상품수) + 수요수준(검색/CTR) + 상승추세
                         trend_score = self._compute_growth_factor(est_vols_qc)
-                        competition_score = max(1.0, math.log1p(max(0, prod_count)))
+                        if rollout_stage >= 2:
+                            season_type = self.detect_seasonality(est_vols_qc)
+                            competition_score = self._compute_competition_score_advanced(
+                                product_count=prod_count,
+                                ad_ratio=float(competition_meta.get("ad_ratio", 0.0) or 0.0),
+                                brand_share=float(competition_meta.get("brand_share", 0.0) or 0.0),
+                                new_ratio=float(competition_meta.get("new_ratio", 0.0) or 0.0),
+                            )
+                        else:
+                            competition_score = max(1.0, math.log1p(max(0, prod_count)))
                         demand_score = math.log1p(max(0.0, avg_qc))
                         conversion_score = max(
                             0.1, math.log1p(max(0.0, avg_clk)) * (1.0 + max(0.0, avg_ctr) / 100.0)
@@ -801,18 +1033,51 @@ class BlueOceanTool:
                         avg_qc = total_qc
                         avg_clk = total_clk
                         avg_ctr = (total_clk / total_qc * 100) if total_qc > 0 else 0
-                        competition_score = max(1.0, math.log1p(max(0, prod_count)))
+                        if rollout_stage >= 2:
+                            competition_score = self._compute_competition_score_advanced(
+                                product_count=prod_count,
+                                ad_ratio=float(competition_meta.get("ad_ratio", 0.0) or 0.0),
+                                brand_share=float(competition_meta.get("brand_share", 0.0) or 0.0),
+                                new_ratio=float(competition_meta.get("new_ratio", 0.0) or 0.0),
+                            )
+                        else:
+                            competition_score = max(1.0, math.log1p(max(0, prod_count)))
                         demand_score = math.log1p(max(0.0, avg_qc))
                         conversion_score = max(
                             0.1, math.log1p(max(0.0, avg_clk)) * (1.0 + max(0.0, avg_ctr) / 100.0)
                         )
                         raw_score = (demand_score * conversion_score / competition_score) * 100.0
 
-                    top10_avg_reviews, top10_avg_price = self.get_coupang_top10_stats(kw)
+                    if rollout_stage >= 2:
+                        top10_avg_reviews, top10_avg_price, sales_profile = self.get_coupang_top10_stats(
+                            kw, include_profile=True
+                        )
+                    else:
+                        top10_avg_reviews, top10_avg_price = self.get_coupang_top10_stats(kw)
                     if top10_avg_reviews is not None and top10_avg_price is not None and top10_avg_price > 0:
                         conversion_score = max(
                             0.1, math.log1p(max(0.0, top10_avg_reviews)) / math.log1p(max(1.0, top10_avg_price))
                         )
+
+                if rollout_stage >= 1 and intent == "구매형":
+                    conversion_score = conversion_score * 1.08
+                if rollout_stage >= 3:
+                    demand_component = min(100.0, demand_score * 28.0)
+                    growth_component = min(100.0, max(0.0, trend_score) * 45.0)
+                    competition_component = min(100.0, (1.0 / max(1.0, competition_score)) * 100.0)
+                    sales_power = float(sales_profile.get("sales_power", 0.0) or 0.0)
+                    intent_boost = {"구매형": 1.08, "탐색형": 1.02, "정보형": 0.98}.get(intent, 1.0)
+                    raw_score = (
+                        demand_component * 0.26
+                        + growth_component * 0.17
+                        + competition_component * 0.24
+                        + sales_power * 0.23
+                        + min(100.0, conversion_score * 22.0) * 0.10
+                    ) * intent_boost
+                elif rollout_stage >= 2:
+                    raw_score = (demand_score * trend_score * conversion_score / max(1.0, competition_score)) * 100.0
+                if rollout_stage >= 2 and season_type != "steady":
+                    log(f"   · {kw}: intent={intent}, season={season_type}, sales_power={sales_profile.get('sales_power', 0.0):.1f}")
 
                 all_results.append({
                     "주제어": seed,
@@ -827,6 +1092,10 @@ class BlueOceanTool:
                     "트렌드 점수": round(trend_score, 4),
                     "전환 점수": round(conversion_score, 4),
                     "경쟁 점수": round(competition_score, 4),
+                    "intent": intent,
+                    "sales_power": round(float(sales_profile.get("sales_power", 0.0) or 0.0), 2),
+                    "competition_score": round(competition_score, 4),
+                    "season_type": season_type,
                     "_raw_score": float(raw_score),
                     "블루오션 점수": 0.0,
                 })
@@ -846,6 +1115,21 @@ class BlueOceanTool:
                 else:
                     norm_score = 100.0 if rs > 0 else 0.0
                 r["블루오션 점수"] = round(norm_score, 2)
+                if rollout_stage >= 3:
+                    r["기회 점수"] = r["블루오션 점수"]
+                    r["판매가치 점수"] = round(
+                        min(
+                            100.0,
+                            float(r.get("sales_power", 0.0) or 0.0) * 0.65
+                            + min(100.0, float(r.get("전환 점수", 0.0) or 0.0) * 22.0) * 0.35,
+                        ),
+                        2,
+                    )
+                    bonus = 4.0 if r.get("intent") == "구매형" else (1.5 if r.get("intent") == "탐색형" else 0.0)
+                    r["최종 점수"] = round(
+                        min(100.0, r["기회 점수"] * 0.45 + r["판매가치 점수"] * 0.55 + bonus),
+                        2,
+                    )
                 r.pop("_raw_score", None)
 
             evaluation_rows = self._build_evaluation_rows(
@@ -871,6 +1155,7 @@ class BlueOceanTool:
             )  # 점수 상위 50개 선별 후 모바일 검색수 내림차순 표시
 
             df["전략 제언"] = df["블루오션 점수"].apply(self._strategy_text)
+            self._last_analysis_detail_df = df.copy()
             report_df = finalize_analysis_dataframe(df)
 
             # DB 저장(기본)
@@ -932,6 +1217,7 @@ class BlueOceanTool:
             return summary, report_df
 
         log("\n❌ 분석 결과가 없습니다. 주제어와 날짜 설정을 확인해주세요.")
+        self._last_analysis_detail_df = pd.DataFrame()
         return None, None
 
 

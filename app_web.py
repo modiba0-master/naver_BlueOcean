@@ -380,6 +380,32 @@ def run() -> None:
                     width='stretch',
                     key="dl_analysis_report",
                 )
+                detail_df = tool.get_last_analysis_detail_df()
+                if isinstance(detail_df, pd.DataFrame) and not detail_df.empty:
+                    with st.expander("소싱 고도화 진단 (Stage 1~3)", expanded=False):
+                        stage_cols = [
+                            "주제어",
+                            "키워드",
+                            "intent",
+                            "season_type",
+                            "sales_power",
+                            "competition_score",
+                            "기회 점수",
+                            "판매가치 점수",
+                            "최종 점수",
+                            "판단 밴드",
+                        ]
+                        visible_cols = [c for c in stage_cols if c in detail_df.columns]
+                        if visible_cols:
+                            st.dataframe(detail_df[visible_cols], width="stretch", hide_index=True)
+                        else:
+                            st.caption("현재 롤아웃 단계에서 추가 진단 컬럼이 아직 생성되지 않았습니다.")
+                        if "intent" in detail_df.columns:
+                            intent_counts = detail_df["intent"].astype(str).value_counts().to_dict()
+                            st.caption(f"intent 분포: {intent_counts}")
+                        if "season_type" in detail_df.columns:
+                            season_counts = detail_df["season_type"].astype(str).value_counts().to_dict()
+                            st.caption(f"season 분포: {season_counts}")
         else:
             st.info("왼쪽 사이드바에서 조건을 설정하고 `분석 실행`을 눌러주세요.")
 
