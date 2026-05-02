@@ -15,7 +15,7 @@ import time
 
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
@@ -573,8 +573,8 @@ class CoupangCrawler:
     @staticmethod
     def _organic_rank_from_rank_mark_li(li: Any) -> Optional[int]:
         """
-        카드 내 RankMark_rank{N}__* 클래스에서 쿠팡이 표시하는 실제 순위(N)를 읽는다.
-        광고 카드에는 보통 부착되지 않아 광고와 혼동을 줄인다.
+        카드(li) 안쪽 말단의 RankMark `<span class="RankMark_rank{N}__...">N</span>` 에서 순위를 읽는다.
+        링크 쿼리의 rank=/searchRank= 값과 불일치할 수 있어 RankMark를 우선한다.
         """
         for el in li.select("[class*='RankMark_rank']"):
             classes = el.get("class") or []
@@ -583,7 +583,7 @@ class CoupangCrawler:
             for cl in classes:
                 if not isinstance(cl, str):
                     continue
-                m = re.search(r"RankMark_rank(\d+)__", cl)
+                m = re.search(r"RankMark_rank(\d+)", cl)
                 if m:
                     try:
                         r = int(m.group(1))
@@ -591,6 +591,14 @@ class CoupangCrawler:
                             return r
                     except ValueError:
                         continue
+            try:
+                txt = el.get_text(strip=True)
+                if txt.isdigit():
+                    r = int(txt)
+                    if 1 <= r <= 10:
+                        return r
+            except Exception:
+                continue
         return None
 
     def _extract_product_fields_from_li(self, li: Any) -> Optional[Dict[str, Any]]:
@@ -1309,6 +1317,32 @@ class CoupangCrawler:
             self._smoke_thread = None
             self._smoke_stop_event = None
 
+    def poll_smoke_startup_outcome(self, timeout_seconds: float = 10.0) -> Tuple[bool, Dict[str, Any]]:
+        """
+        스모크 Chromium 기동 직후 phase 안정화까지 폴링한다.
+        Streamlit 버튼 핸들러에 두던 로직과 동일한 성공 판정을 유지한다.
+        """
+        deadline_poll = time.monotonic() + float(timeout_seconds)
+        ok = False
+        last: Dict[str, Any] = {}
+        while time.monotonic() < deadline_poll:
+            last = self.get_smoke_playwright_status()
+            if last.get("phase") == "opened":
+                ok = True
+                break
+            if last.get("phase") == "failed":
+                ok = False
+                break
+            if not self.is_smoke_playwright_running():
+                break
+            time.sleep(0.2)
+        if not ok and self.is_smoke_playwright_running():
+            last = self.get_smoke_playwright_status()
+            ph = str(last.get("phase") or "")
+            if ph not in ("failed", "idle", "closed", "queued"):
+                ok = True
+        return ok, last
+
     def _run_smoke_worker(self, url: str, max_wait_seconds: float, stop_event: threading.Event) -> None:
         """별도 스레드에서 실행. persistent 크롤 세션과 무관한 ephemeral Chromium."""
         target = str(url).strip() or "https://www.google.com/"
@@ -1612,10 +1646,7 @@ class CoupangCrawler:
                                 except Exception:
                                     safe_print("[SMOKE] 상품 리스트 DOM 대기 타임아웃 — probe는 계속 시도")
                                 page.wait_for_timeout(500)
-                                # 광고 제외 1~10위 추출 전: 지연 로드 카드를 위해 마우스 스크롤·하단 이동
-                                self._scroll_coupang_search_results_page(page)
-                                page.wait_for_timeout(400)
-                                self._scroll_coupang_search_results_page(page, max_wheel_batches=10)
+                                # 먼저 현재 DOM만 evaluate로 읽음(RankMark 등). 부족할 때만 아래에서 스크롤 후 재시도.
                                 self._smoke_status_update(
                                     phase="smoke_coupang_search_done",
                                     hint=f"쿠팡 검색 실행 완료: {search_kw!r}",
@@ -1624,7 +1655,7 @@ class CoupangCrawler:
                                 try:
                                     self._smoke_status_update(
                                         phase="smoke_coupang_html_probe",
-                                        hint="결과 페이지 HTML에서 상품명/가격 추출 가능 여부를 확인합니다.",
+                                        hint="결과 페이지 DOM에서 RankMark·카드 정보를 읽습니다(선 스크롤 없음).",
                                     )
                                     _probe_js = r"""() => {
                                         const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
@@ -1777,13 +1808,24 @@ class CoupangCrawler:
                                             for (let ri = 0; ri < nodes.length; ri++) {
                                                 const el = nodes[ri];
                                                 const cls = el.className || "";
-                                                const parts = (typeof cls === "string" ? cls : "").split(/\s+/);
+                                                const blob = typeof cls === "string" ? cls : String(cls || "");
+                                                const mWhole = blob.match(/RankMark_rank(\d+)/);
+                                                if (mWhole) {
+                                                    const rv = parseInt(mWhole[1], 10);
+                                                    if (rv >= 1 && rv <= 10) return rv;
+                                                }
+                                                const parts = blob.split(/\s+/);
                                                 for (let pj = 0; pj < parts.length; pj++) {
-                                                    const mm = parts[pj].match(/^RankMark_rank(\d+)__/);
+                                                    const mm = parts[pj].match(/^RankMark_rank(\d+)/);
                                                     if (mm) {
-                                                        const rv = parseInt(mm[1], 10);
-                                                        if (rv >= 1 && rv <= 10) return rv;
+                                                        const rv2 = parseInt(mm[1], 10);
+                                                        if (rv2 >= 1 && rv2 <= 10) return rv2;
                                                     }
+                                                }
+                                                const t = norm(el.textContent || "");
+                                                if (/^\d{1,2}$/.test(t)) {
+                                                    const rv3 = parseInt(t, 10);
+                                                    if (rv3 >= 1 && rv3 <= 10) return rv3;
                                                 }
                                             }
                                             return null;
@@ -1819,7 +1861,7 @@ class CoupangCrawler:
                                         }
                                         let organic_count = Object.keys(byRank).length;
                                         if (organic_count === 0) {
-                                            const organic = [];
+                                            const organicRows = [];
                                             const seenUrls = new Set();
                                             for (const card of cards) {
                                                 if (isAd(card)) continue;
@@ -1829,10 +1871,10 @@ class CoupangCrawler:
                                                 const u = norm(row.url);
                                                 if (u && seenUrls.has(u)) continue;
                                                 if (u) seenUrls.add(u);
-                                                organic.push(row);
+                                                organicRows.push(row);
                                             }
-                                            organic_count = organic.length;
-                                            top10 = organic.slice(0, 10).map((row, idx) => ({
+                                            organic_count = organicRows.length;
+                                            top10 = organicRows.slice(0, 10).map((row, idx) => ({
                                                 rank: idx + 1,
                                                 title: row.title,
                                                 price: row.price,
@@ -1849,14 +1891,53 @@ class CoupangCrawler:
                                             url: row.url,
                                         }));
                                         const html = document.documentElement && document.documentElement.outerHTML;
+                                        const nextDataProbe = (() => {
+                                            const el = document.getElementById("__NEXT_DATA__");
+                                            const winHas =
+                                                typeof window.__NEXT_DATA__ !== "undefined" &&
+                                                window.__NEXT_DATA__ !== null;
+                                            if (!el || !el.textContent) {
+                                                return {
+                                                    script_present: false,
+                                                    window_present: winHas,
+                                                };
+                                            }
+                                            try {
+                                                const j = JSON.parse(el.textContent);
+                                                const rootKeys =
+                                                    j && typeof j === "object"
+                                                        ? Object.keys(j).slice(0, 24)
+                                                        : [];
+                                                let propsKeys = [];
+                                                if (j && j.props && typeof j.props === "object") {
+                                                    propsKeys = Object.keys(j.props).slice(0, 24);
+                                                }
+                                                return {
+                                                    script_present: true,
+                                                    parse_ok: true,
+                                                    root_keys: rootKeys,
+                                                    props_keys: propsKeys,
+                                                    window_present: winHas,
+                                                };
+                                            } catch (e) {
+                                                return {
+                                                    script_present: true,
+                                                    parse_ok: false,
+                                                    parse_err: String(e),
+                                                    window_present: winHas,
+                                                };
+                                            }
+                                        })();
                                         return {
                                             url: location.href,
                                             title: document.title || "",
                                             html_len: html ? html.length : 0,
                                             card_count: cards.length,
-                                            organic_count: organic.length,
+                                            organic_count: organic_count,
                                             top10: top10,
                                             sample: sample,
+                                            next_data_probe: nextDataProbe,
+                                            _probe_rev: "rankmark-nextdata-probe-20260203",
                                         };
                                     }"""
                                     probe: Optional[Dict[str, Any]] = None
@@ -1886,9 +1967,9 @@ class CoupangCrawler:
                                     _t10 = list(probe.get("top10") or [])
                                     if len(_t10) < 10:
                                         safe_print(
-                                            f"[SMOKE] 비광고 {len(_t10)}개만 확보됨 — 추가 스크롤 후 probe 1회 재시도"
+                                            f"[SMOKE] 첫 probe 상품 {len(_t10)}개 — 지연 로드 대비 마우스 스크롤 후 probe 1회 재시도"
                                         )
-                                        self._scroll_coupang_search_results_page(page, max_wheel_batches=12)
+                                        self._scroll_coupang_search_results_page(page, max_wheel_batches=10)
                                         page.wait_for_timeout(450)
                                         try:
                                             probe2 = page.evaluate(_probe_js)
@@ -1909,6 +1990,7 @@ class CoupangCrawler:
                                     )
                                     safe_print(f"[SMOKE] HTML probe top10={probe.get('top10', [])!r}")
                                     safe_print(f"[SMOKE] HTML probe sample={probe.get('sample', [])!r}")
+                                    safe_print(f"[SMOKE] next_data_probe={probe.get('next_data_probe')!r}")
                                     smoke_payload = {
                                         "saved_at": datetime.now().isoformat(timespec="seconds"),
                                         "keyword": search_kw,

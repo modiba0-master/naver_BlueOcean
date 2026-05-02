@@ -123,6 +123,49 @@ def apply_database_env_from_config(config_path: str = "config.json") -> None:
     apply_db_cfg_dict_to_env(merged_db)
 
 
+def apply_admin_env_from_config(config_path: str = "config.json") -> None:
+    """
+    config.json + config.local.json 의 admin 항목을 MODIBA_ADMIN_* 환경변수로 올린다.
+    같은 키는 config.local.json 이 우선. 이미 설정된 env 는 덮어쓰지 않는다.
+
+    예시 (config.local.json, git 제외 권장):
+      "admin": {
+        "modiba_admin_id": "your_login_id",
+        "modiba_admin_password": "your_secret"
+      }
+    """
+    merged_adm: Dict[str, Any] = {}
+    for filename in (config_path, "config.local.json"):
+        resolved = resource_path(filename)
+        if not os.path.isfile(resolved):
+            continue
+        try:
+            with open(resolved, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            continue
+        adm = cfg.get("admin") or {}
+        if isinstance(adm, dict):
+            merged_adm.update(adm)
+
+    aid = str(
+        merged_adm.get("modiba_admin_id")
+        or merged_adm.get("MODIBA_ADMIN_ID")
+        or merged_adm.get("id")
+        or ""
+    ).strip()
+    apw = str(
+        merged_adm.get("modiba_admin_password")
+        or merged_adm.get("MODIBA_ADMIN_PASSWORD")
+        or merged_adm.get("password")
+        or ""
+    ).strip()
+    if aid and not (os.environ.get("MODIBA_ADMIN_ID") or "").strip():
+        os.environ["MODIBA_ADMIN_ID"] = aid
+    if apw and not (os.environ.get("MODIBA_ADMIN_PASSWORD") or "").strip():
+        os.environ["MODIBA_ADMIN_PASSWORD"] = apw
+
+
 class NaverSearchAdsAPI:
     def __init__(self, config):
         self.access_license = config['access_license']

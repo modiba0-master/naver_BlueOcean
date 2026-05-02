@@ -1,13 +1,10 @@
 import asyncio
-import json
 import os
 import subprocess
 import sys
-import time
 import webbrowser
 from collections import Counter
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pandas as pd
@@ -21,60 +18,20 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from blue_ocean_tool import BlueOceanTool, apply_database_env_from_config
-from coupang_crawler import get_shared_crawler
+from blue_ocean_tool import (
+    BlueOceanTool,
+    apply_admin_env_from_config,
+    apply_database_env_from_config,
+)
+from coupang_tab import render_coupang_keyword_analysis_tab
 from db import (
     get_connection,
     is_dsn_configured,
-    query_coupang_latest_ranked_items,
     query_market_score_rows,
 )
 from report_format import report_to_excel_bytes
 
 _GOOGLE_HOME_URL = "https://www.google.com/"
-_PLAYWRIGHT_SMOKE_MAX_SECONDS = 5.0
-
-_LAST_SMOKE_JSON_PATH = Path(__file__).resolve().parent / ".smoke" / "last_smoke_extract.json"
-
-
-def _smoke_file_fallback_ranked(keyword: str, limit: int = 10) -> List[dict]:
-    """메모리/DB가 비었을 때 .smoke/last_smoke_extract.json 과 동일 키워드면 순위표 폴백."""
-    if not _LAST_SMOKE_JSON_PATH.is_file():
-        return []
-    try:
-        with open(_LAST_SMOKE_JSON_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return []
-        if str(data.get("keyword", "")).strip() != str(keyword).strip():
-            return []
-        items = data.get("top10") or data.get("top3") or []
-        if not isinstance(items, list):
-            return []
-        out = []
-        for it in items[:limit]:
-            if not isinstance(it, dict):
-                continue
-            try:
-                rk = int(it.get("rank") or 0)
-            except Exception:
-                rk = 0
-            if rk < 1:
-                continue
-            out.append(
-                {
-                    "rank": rk,
-                    "title": str(it.get("title", "")),
-                    "price": str(it.get("price", "")),
-                    "shipping": str(it.get("shipping", "")),
-                    "review_count": str(it.get("review_count", "")),
-                    "review_score": str(it.get("review_score", "")),
-                    "url": str(it.get("url", "")),
-                }
-            )
-        return out
-    except Exception:
-        return []
 
 
 def _chrome_exe_candidates_windows() -> List[str]:
@@ -199,98 +156,6 @@ def get_tool() -> BlueOceanTool:
     return BlueOceanTool(config_path="config.json")
 
 
-_COUPANG_TABLE_REFRESH_SEC = 2.0
-
-
-@st.fragment(run_every=timedelta(seconds=_COUPANG_TABLE_REFRESH_SEC))
-def _render_coupang_rank_table_live(keyword_text: str) -> None:
-    """스모크 probe 직후 메모리 캐시를 우선 표시하고, DB·JSON 폴백 및 JSON 갱신 시 전체 rerun."""
-    if _LAST_SMOKE_JSON_PATH.is_file():
-        try:
-            mt = _LAST_SMOKE_JSON_PATH.stat().st_mtime
-            prev = st.session_state.get("_last_smoke_extract_mtime")
-            if prev is None:
-                st.session_state["_last_smoke_extract_mtime"] = mt
-            elif mt > float(prev):
-                st.session_state["_last_smoke_extract_mtime"] = mt
-                st.rerun()
-        except OSError:
-            pass
-
-    tool_local = get_tool()
-    cc = get_shared_crawler()
-    kw = str(keyword_text).strip()
-    coupang_items: List[dict] = []
-    from_memory = False
-    from_json_file = False
-    if kw:
-        _cache_fn = getattr(cc, "get_smoke_ranked_ui_cache", None)
-        coupang_items = list(_cache_fn(kw)) if callable(_cache_fn) else []
-        from_memory = bool(coupang_items)
-        if not coupang_items and is_dsn_configured():
-            try:
-                coupang_items = query_coupang_latest_ranked_items(kw, limit=10)
-            except Exception as ex:
-                st.caption(f"쿠팡 DB 조회 실패: {ex}")
-        if not coupang_items:
-            coupang_items = _smoke_file_fallback_ranked(kw, limit=10)
-            from_json_file = bool(coupang_items)
-
-    top10_template = pd.DataFrame(
-        [
-            {
-                "순위": rank,
-                "상품명": "",
-                "가격(원)": "",
-                "리뷰수": "",
-                "평점": "",
-                "배송비": "",
-                "상품 URL": "",
-            }
-            for rank in range(1, 11)
-        ]
-    )
-    by_rank = {int(i["rank"]): i for i in coupang_items if isinstance(i, dict) and i.get("rank")}
-    for rk in range(1, 11):
-        item = by_rank.get(rk)
-        if not item:
-            continue
-        top10_template.at[rk - 1, "상품명"] = str(item.get("title", "")).strip()
-        top10_template.at[rk - 1, "가격(원)"] = str(item.get("price", "")).strip()
-        top10_template.at[rk - 1, "리뷰수"] = str(item.get("review_count", "")).strip()
-        top10_template.at[rk - 1, "평점"] = str(item.get("review_score", "")).strip()
-        top10_template.at[rk - 1, "배송비"] = str(item.get("shipping", "")).strip()
-        top10_template.at[rk - 1, "상품 URL"] = str(item.get("url", "")).strip()
-    st.dataframe(top10_template, width="stretch", hide_index=True)
-
-    if kw:
-        if coupang_items:
-            if from_memory:
-                st.caption(
-                    "표시: 방금 스모크 **메모리 결과**(최대 10위). 같은 내용이 MariaDB 및 `.smoke/last_smoke_extract.json` 에 저장되며, "
-                    "JSON이 갱신되면 전체 화면을 새로고침합니다."
-                )
-            elif from_json_file:
-                st.caption(
-                    "표시: `.smoke/last_smoke_extract.json` 과 입력 키워드가 일치하는 **파일 폴백** 결과(최대 10위)."
-                )
-            else:
-                st.caption("표시: MariaDB에 저장된 해당 키워드 **가장 최근** 결과(최대 10위).")
-        elif getattr(cc, "is_smoke_playwright_running", lambda: False)():
-            st.caption(
-                "스모크 실행 중입니다. 순위표는 probe 완료 후 수 초 안에 자동으로 채워집니다 "
-                f"(약 {_COUPANG_TABLE_REFRESH_SEC:.0f}초 간격 갱신)."
-            )
-        elif not is_dsn_configured():
-            st.caption(
-                "MariaDB가 설정되지 않았습니다. 스모크 결과는 **메모리에만** 남으며, 페이지를 새로고침하면 사라질 수 있습니다."
-            )
-        else:
-            st.caption(
-                "해당 키워드로 저장된 결과가 없습니다. 검색 실행 후 잠시만 기다리거나 다른 탭으로 갔다 오세요."
-            )
-
-
 @st.cache_data
 def detect_naver_categories(seed_keyword: str, client_id: str, client_secret: str) -> Tuple[List[str], str]:
     seed = str(seed_keyword).strip()
@@ -338,6 +203,7 @@ def detect_naver_categories(seed_keyword: str, client_id: str, client_secret: st
 def run() -> None:
     st.set_page_config(page_title="Modiba BlueOcean", layout="wide")
     apply_database_env_from_config("config.json")
+    apply_admin_env_from_config("config.json")
     _inject_tab_style()
     st.title("Modiba BlueOcean Web")
     st.caption("Railway 웹서비스용 - 관리자 인증 후 대시보드 접근")
@@ -352,23 +218,44 @@ def run() -> None:
     if not admin_id or not admin_pw:
         st.error(
             "관리자 계정이 설정되지 않았습니다. "
-            "환경변수 `MODIBA_ADMIN_ID`, `MODIBA_ADMIN_PASSWORD`를 설정해주세요."
+            "환경변수 `MODIBA_ADMIN_ID`, `MODIBA_ADMIN_PASSWORD`를 설정하거나, "
+            "`config.local.json`의 `admin.modiba_admin_id` / `admin.modiba_admin_password`를 설정한 뒤 "
+            "앱을 다시 시작해주세요."
         )
         return
 
     if not st.session_state["is_admin_authed"]:
+        # 재시작 후에도 config.local.json → env 로 올라온 계정으로 폼 초기값 유지
+        if "login_form_admin_id" not in st.session_state:
+            st.session_state["login_form_admin_id"] = admin_id
+        _prefill_pw = str(os.getenv("MODIBA_ADMIN_LOGIN_PREFILL_PW", "1")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if "login_form_admin_pw" not in st.session_state:
+            st.session_state["login_form_admin_pw"] = admin_pw if _prefill_pw else ""
+
         with st.form("admin_login_form", clear_on_submit=False):
-            input_id = st.text_input("관리자 아이디", value="")
-            input_pw = st.text_input("관리자 비밀번호", value="", type="password")
+            st.text_input("관리자 아이디", key="login_form_admin_id")
+            st.text_input("관리자 비밀번호", key="login_form_admin_pw", type="password")
             submitted = st.form_submit_button("관리자 로그인", type="primary")
             if submitted:
-                if input_id == admin_id and input_pw == admin_pw:
+                tid = str(st.session_state.get("login_form_admin_id", "")).strip()
+                tpw = str(st.session_state.get("login_form_admin_pw", "")).strip()
+                if tid == admin_id and tpw == admin_pw:
                     st.session_state["is_admin_authed"] = True
                     st.success("인증 성공. 대시보드로 이동합니다.")
                     st.rerun()
                 else:
                     st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
-        st.info("관리자 계정으로 로그인해야 대시보드 접근이 가능합니다.")
+        st.info(
+            "관리자 계정으로 로그인해야 대시보드 접근이 가능합니다. "
+            "아이디·비밀번호는 `config.local.json`의 `admin` 또는 환경변수에서 불러오며, "
+            "앱 재시작 후에도 동일 설정이 적용됩니다. 비밀번호 자동 채움을 끄려면 "
+            "`MODIBA_ADMIN_LOGIN_PREFILL_PW=0` 을 설정하세요."
+        )
         return
 
     if "seed_input" not in st.session_state:
@@ -388,6 +275,10 @@ def run() -> None:
         st.subheader("실행 설정")
         if st.button("로그아웃", width='stretch'):
             st.session_state["is_admin_authed"] = False
+            if "login_form_admin_id" in st.session_state:
+                del st.session_state["login_form_admin_id"]
+            if "login_form_admin_pw" in st.session_state:
+                del st.session_state["login_form_admin_pw"]
             st.rerun()
         seeds_text = st.text_input("주제어(쉼표로 구분)", key="seed_input")
         detect_clicked = st.button("주제어 기반 카테고리 찾기", width='stretch')
@@ -668,128 +559,7 @@ def run() -> None:
                 st.info("조회 결과가 없습니다.")
 
     with tab_coupang:
-        st.subheader("쿠팡 상품 키워드 분석")
-        st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시합니다.")
-        if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_NAME"):
-            st.info(
-                "Railway 등 **원격 서버**에서 앱이 실행 중입니다. Playwright Chromium 창은 **서버 쪽**에만 열리고, "
-                "지금 쓰는 브라우저가 있는 **이 PC 화면에는 창이 보이지 않습니다.** "
-                "확인은 아래 **스모크 상태**(phase·URL·JSON)로 하시면 됩니다. "
-                "이 PC에서 창까지 보려면 저장소를 받아 로컬에서 `streamlit run app_web.py` 를 실행하세요."
-            )
-        st.caption(
-            "**키워드 검색** 은 입력한 쿠팡 키워드로 Playwright Chromium 스모크를 실행합니다. "
-            f"최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초 유지하며, **[강제 종료]** 로 중단할 수 있습니다."
-        )
-        st.caption(
-            "이 화면은 **PNG 스크린샷을 저장하지 않습니다**(.smoke/smoke_step*.png 등은 Cursor·외부 스모크 도구 산물일 수 있음). "
-            "브라우저 **세션 스냅샷** 저장만 `.smoke/coupang_state.json` 에 하며, 끄려면 `COUPANG_SMOKE_STORAGE_STATE=false` "
-            "환경변수를 설정하세요."
-        )
-
-        c_input_col1, c_input_col2 = st.columns([3, 1])
-        with c_input_col1:
-            coupang_keyword = st.text_input(
-                "쿠팡 검색 키워드",
-                value="",
-                placeholder="예: 그램 노트북",
-                key="coupang_single_keyword",
-            )
-        with c_input_col2:
-            prep_pw_smoke_clicked = st.button(
-                "키워드 검색",
-                key="coupang_prep_pw_smoke_btn",
-                width='stretch',
-            )
-
-        prep_pw_stop_clicked = st.button(
-            "Playwright Chromium 강제 종료",
-            key="coupang_prep_pw_smoke_stop_btn",
-            width='stretch',
-            disabled=not tool.coupang_crawler.is_smoke_playwright_running(),
-        )
-        if tool.coupang_crawler.is_smoke_playwright_running():
-            st.caption(
-                f"스모크 Chromium 실행 중 — 최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초 유지 또는 위 버튼으로 즉시 종료."
-            )
-
-        if prep_pw_smoke_clicked:
-            if not str(coupang_keyword).strip():
-                st.warning("쿠팡 검색 키워드를 입력해주세요.")
-                ok = False
-            else:
-                os.environ["COUPANG_SMOKE_COUPANG_QUERY"] = str(coupang_keyword).strip()
-                with st.spinner("Playwright Chromium 백그라운드 시작 중..."):
-                    ok_start = tool.coupang_crawler.smoke_open_playwright_chromium_window(
-                        url=_GOOGLE_HOME_URL,
-                        wait_seconds=_PLAYWRIGHT_SMOKE_MAX_SECONDS,
-                    )
-                    ok = False
-                    if ok_start:
-                        deadline_poll = time.monotonic() + 10.0
-                        while time.monotonic() < deadline_poll:
-                            st_smoke = tool.coupang_crawler.get_smoke_playwright_status()
-                            if st_smoke.get("phase") == "opened":
-                                ok = True
-                                break
-                            if st_smoke.get("phase") == "failed":
-                                ok = False
-                                break
-                            if not tool.coupang_crawler.is_smoke_playwright_running():
-                                break
-                            time.sleep(0.2)
-                        if not ok and tool.coupang_crawler.is_smoke_playwright_running():
-                            st_smoke = tool.coupang_crawler.get_smoke_playwright_status()
-                            ph = str(st_smoke.get("phase") or "")
-                            if ph not in ("failed", "idle", "closed", "queued"):
-                                ok = True
-                st.session_state["coupang_prep_status"] = {
-                    "mode": "playwright_chromium_smoke",
-                    "ok": bool(ok),
-                    "stats": tool.coupang_crawler.get_stats(),
-                    "last_error": tool.coupang_crawler.get_last_error(),
-                    "note": (
-                        f"키워드={str(coupang_keyword).strip()!r}, "
-                        f"별도 창 유지 최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초. "
-                        "아래 **스모크 상태** 패널에서 phase·URL로 진행 여부를 확인하세요."
-                    ),
-                }
-
-        if prep_pw_stop_clicked:
-            tool.coupang_crawler.stop_smoke_playwright_chromium_window()
-            st.session_state["coupang_prep_status"] = {
-                "mode": "playwright_chromium_smoke_stop",
-                "ok": True,
-                "stats": tool.coupang_crawler.get_stats(),
-                "last_error": {},
-                "note": "스모크 Chromium 종료 요청을 보냈습니다.",
-            }
-
-        prep_status = st.session_state.get("coupang_prep_status")
-        if isinstance(prep_status, dict):
-            mode = prep_status.get("mode", "unknown")
-            if prep_status.get("ok"):
-                st.success(f"접속 준비 확인 성공(mode={mode})")
-            else:
-                st.warning(f"접속 준비 확인 실패(mode={mode})")
-            st.caption(f"prep_stats={prep_status.get('stats', {})}")
-            if prep_status.get("last_error"):
-                st.error(f"prep_last_error={prep_status.get('last_error')}")
-            if prep_status.get("note"):
-                st.caption(str(prep_status.get("note")))
-
-        smpv = tool.coupang_crawler.get_smoke_playwright_status()
-        if str(smpv.get("phase") or "idle") != "idle":
-            with st.expander(
-                "Playwright Chromium 스모크 — 창·로드 확인 (phase / 상태)",
-                expanded=bool(smpv.get("thread_alive")),
-            ):
-                st.json(smpv)
-                if smpv.get("thread_alive") and smpv.get("phase") not in ("failed", "closed", "opened"):
-                    st.caption("로드 중이면 잠시 후 **Rerun / 새로고침**으로 다시 확인하세요.")
-
-        _render_coupang_rank_table_live(coupang_keyword)
-        st.caption("표시 컬럼: 순위, 상품명, 가격, 리뷰수, 평점, 배송비, 상품 URL")
+        render_coupang_keyword_analysis_tab()
 
 
 if __name__ == "__main__":
