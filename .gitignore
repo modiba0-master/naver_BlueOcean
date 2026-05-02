@@ -11,3 +11,6 @@
 
 # Playwright smoke storage_state (cookies/session — local only)
 .smoke/
+
+# 로컬만 Railway MariaDB 공개 URL 등 (커밋 금지)
+config.local.json

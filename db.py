@@ -13,10 +13,39 @@ from urllib.parse import unquote, urlparse
 import pymysql
 
 
+def is_dsn_configured() -> bool:
+    """환경에 DB URL 또는 host+user가 있으면 True (연결 성공 여부는 검사하지 않음)."""
+    url = (
+        os.environ.get("MYSQL_URL")
+        or os.environ.get("MYSQL_PUBLIC_URL")
+        or os.environ.get("MARIADB_PUBLIC_URL")
+        or os.environ.get("MARIADB_URL")
+        or os.environ.get("DATABASE_URL")
+        or os.environ.get("DATABASE_PUBLIC_URL")
+        or ""
+    ).strip()
+    if url:
+        return True
+    host = (
+        os.environ.get("MARIADB_HOST")
+        or os.environ.get("MYSQLHOST")
+        or os.environ.get("DB_HOST")
+        or ""
+    ).strip()
+    user = (
+        os.environ.get("MARIADB_USER")
+        or os.environ.get("MYSQLUSER")
+        or os.environ.get("DB_USER")
+        or ""
+    ).strip()
+    return bool(host and user)
+
+
 def _dsn_from_env() -> Dict[str, Any]:
     url = (
         os.environ.get("MYSQL_URL")
         or os.environ.get("MYSQL_PUBLIC_URL")
+        or os.environ.get("MARIADB_PUBLIC_URL")
         or os.environ.get("MARIADB_URL")
         or os.environ.get("DATABASE_URL")
         or os.environ.get("DATABASE_PUBLIC_URL")
@@ -49,8 +78,11 @@ def _dsn_from_env() -> Dict[str, Any]:
     ).strip()
     if not host or not user:
         raise RuntimeError(
-            "Set MYSQL_URL/MARIADB_URL or host/user vars "
-            "(MARIADB_HOST+MARIADB_USER, MYSQLHOST+MYSQLUSER)."
+            "DB 연결 정보가 없습니다. 다음 중 하나를 설정하세요 — "
+            "전체 URL: MARIADB_PUBLIC_URL 또는 MYSQL_PUBLIC_URL 또는 MYSQL_URL 또는 MARIADB_URL 또는 DATABASE_URL / DATABASE_PUBLIC_URL; "
+            "또는 호스트+계정: MARIADB_HOST+MARIADB_USER(+비밀번호 등). "
+            "로컬 PC에서는 Railway MariaDB의 TCP 프록시 URL(MARIADB_PUBLIC_URL)을 쓰거나, "
+            "같은 프로젝트에서 `railway run streamlit run app_web.py` 처럼 railway run으로 실행하세요."
         )
 
     # *.railway.internal 은 Railway 프라이빗 네트워크 안에서만 해석됨 (로컬 PC에서는 연결 불가).
@@ -63,7 +95,7 @@ def _dsn_from_env() -> Dict[str, Any]:
         if not railway_like:
             raise RuntimeError(
                 "MARIADB_HOST ends with .railway.internal — this hostname only works inside Railway. "
-                "For local runs add MYSQL_PUBLIC_URL (TCP Proxy URL from Railway MariaDB) or MYSQL_URL "
+                "For local runs add MARIADB_PUBLIC_URL / MYSQL_PUBLIC_URL (TCP Proxy URL from Railway MariaDB) or MYSQL_URL "
                 "with a public host, or remove MARIADB_HOST when using a full DB URL."
             )
 
@@ -774,9 +806,9 @@ def insert_coupang_search_snapshot(payload: Dict[str, Any]) -> int:
         except Exception:
             return None
 
-    top3_items = payload.get("top3", [])
-    if not isinstance(top3_items, list):
-        top3_items = []
+    rank_items = payload.get("top10") or payload.get("top3") or []
+    if not isinstance(rank_items, list):
+        rank_items = []
 
     inserted_items = 0
     with get_connection() as conn:
@@ -802,7 +834,7 @@ def insert_coupang_search_snapshot(payload: Dict[str, Any]) -> int:
             run_id = int(cur.lastrowid)
 
             batch: List[tuple] = []
-            for item in top3_items:
+            for item in rank_items:
                 if not isinstance(item, dict):
                     continue
                 try:
@@ -842,3 +874,46 @@ def insert_coupang_search_snapshot(payload: Dict[str, Any]) -> int:
                 )
                 inserted_items = len(batch)
     return inserted_items
+
+
+def query_coupang_latest_ranked_items(keyword_text: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    해당 키워드로 가장 최근 저장된 스모크/크롤 run의 순위별 상품 행을 반환한다 (기본 최대 10개).
+    """
+    kw = str(keyword_text or "").strip()[:255]
+    if not kw:
+        return []
+    lim = max(1, min(int(limit), 50))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT i.rank_no, i.product_title, i.price_text, i.shipping_text,
+                       i.review_count_text, i.review_score_text, i.product_url
+                FROM coupang_search_ranked_items i
+                INNER JOIN (
+                    SELECT id FROM coupang_search_runs
+                    WHERE keyword_text = %s
+                    ORDER BY collected_at DESC
+                    LIMIT 1
+                ) latest ON i.run_id = latest.id
+                WHERE i.rank_no <= %s
+                ORDER BY i.rank_no ASC
+                """,
+                (kw, lim),
+            )
+            rows = cur.fetchall()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "rank": int(row[0] or 0),
+                "title": row[1] or "",
+                "price": row[2] or "",
+                "shipping": row[3] or "",
+                "review_count": row[4] or "",
+                "review_score": row[5] or "",
+                "url": row[6] or "",
+            }
+        )
+    return out

@@ -21,42 +21,52 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from blue_ocean_tool import BlueOceanTool
-from db import query_market_score_rows
+from blue_ocean_tool import BlueOceanTool, apply_database_env_from_config
+from db import (
+    get_connection,
+    is_dsn_configured,
+    query_coupang_latest_ranked_items,
+    query_market_score_rows,
+)
 from report_format import report_to_excel_bytes
 
 _GOOGLE_HOME_URL = "https://www.google.com/"
-_PLAYWRIGHT_SMOKE_MAX_SECONDS = 300.0
+_PLAYWRIGHT_SMOKE_MAX_SECONDS = 5.0
 
 
-def _read_last_smoke_extract_top3() -> List[dict]:
+def _smoke_file_fallback_ranked(keyword: str, limit: int = 10) -> List[dict]:
+    """DB 조회 실패·미설정 시에만: 로컬 JSON에서 같은 키워드의 top10/top3 보조 로드."""
     p = Path(__file__).resolve().parent / ".smoke" / "last_smoke_extract.json"
     if not p.is_file():
         return []
     try:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
-        top3 = data.get("top3", []) if isinstance(data, dict) else []
-        return top3 if isinstance(top3, list) else []
+        if not isinstance(data, dict):
+            return []
+        if str(data.get("keyword", "")).strip() != str(keyword).strip():
+            return []
+        items = data.get("top10") or data.get("top3") or []
+        if not isinstance(items, list):
+            return []
+        out = []
+        for it in items[:limit]:
+            if not isinstance(it, dict):
+                continue
+            out.append(
+                {
+                    "rank": int(it.get("rank") or 0),
+                    "title": str(it.get("title", "")),
+                    "price": str(it.get("price", "")),
+                    "shipping": str(it.get("shipping", "")),
+                    "review_count": str(it.get("review_count", "")),
+                    "review_score": str(it.get("review_score", "")),
+                    "url": str(it.get("url", "")),
+                }
+            )
+        return [x for x in out if x["rank"] >= 1]
     except Exception:
         return []
-
-
-def _read_recent_smoke_screenshots(limit: int = 4) -> List[dict]:
-    """최근 스모크 캡처 파일을 시간순으로 반환한다."""
-    base = Path(__file__).resolve().parent / ".smoke"
-    if not base.is_dir():
-        return []
-    files = sorted(base.glob("smoke_step*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
-    picked = list(reversed(files[: max(1, int(limit))]))
-    out: List[dict] = []
-    for p in picked:
-        try:
-            ts = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            ts = "-"
-        out.append({"path": str(p), "name": p.name, "captured_at": ts})
-    return out
 
 
 def _chrome_exe_candidates_windows() -> List[str]:
@@ -227,6 +237,7 @@ def detect_naver_categories(seed_keyword: str, client_id: str, client_secret: st
 
 def run() -> None:
     st.set_page_config(page_title="Modiba BlueOcean", layout="wide")
+    apply_database_env_from_config("config.json")
     _inject_tab_style()
     st.title("Modiba BlueOcean Web")
     st.caption("Railway 웹서비스용 - 관리자 인증 후 대시보드 접근")
@@ -306,10 +317,24 @@ def run() -> None:
         mode_label = st.selectbox("분석 모드", ["빠른 모드", "정밀 모드"], index=0)
         run_clicked = st.button("분석 실행", type="primary", width='stretch')
 
-        st.divider()    
+        st.divider()
         st.markdown("**환경 확인**")
-        has_mysql_url = bool((os.getenv("MYSQL_URL") or "").strip())
-        st.write(f"- MYSQL_URL 설정: {'예' if has_mysql_url else '아니오'}")
+        # db._dsn_from_env 우선순위와 동일하게 URL 존재 여부만 표시 (값은 노출하지 않음)
+        _db_url = (
+            (os.getenv("MYSQL_URL") or "").strip()
+            or (os.getenv("MYSQL_PUBLIC_URL") or "").strip()
+            or (os.getenv("MARIADB_PUBLIC_URL") or "").strip()
+            or (os.getenv("MARIADB_URL") or "").strip()
+            or (os.getenv("DATABASE_URL") or "").strip()
+            or (os.getenv("DATABASE_PUBLIC_URL") or "").strip()
+        )
+        has_db_url = bool(_db_url)
+        st.write(f"- MariaDB 접속 URL 환경변수: {'예' if has_db_url else '아니오'}")
+        if not has_db_url:
+            st.caption(
+                "로컬에서는 Railway TCP 프록시 주소가 필요합니다. 예: MARIADB_PUBLIC_URL, MYSQL_PUBLIC_URL 또는 MYSQL_URL "
+                "(railway.internal 호스트는 PC에서 해석되지 않습니다.)"
+            )
 
     tool = get_tool()
 
@@ -371,6 +396,31 @@ def run() -> None:
         st.subheader("시장성 점수 조회 (DB)")
         st.caption("최종 점수 = 수요 점수 × 트렌드 점수 × 전환 점수 ÷ 경쟁 점수")
 
+        if not is_dsn_configured():
+            st.warning(
+                "MariaDB 접속 정보가 환경에 없습니다. PowerShell 예: "
+                "`$env:MARIADB_PUBLIC_URL='mariadb://...'` 후 앱 재실행, 또는 "
+                "`railway run streamlit run app_web.py`, 또는 `config.json`에 "
+                "`database.mariadb_public_url` 을 추가하세요."
+            )
+        else:
+            with st.expander("MariaDB 연결 확인", expanded=False):
+                if st.button("연결 테스트 (SELECT 1)", key="db_ping_market_tab"):
+                    try:
+                        with get_connection() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("SELECT 1")
+                                cur.fetchone()
+                                cur.execute("SELECT DATABASE(), VERSION()")
+                                row = cur.fetchone()
+                        dbname = row[0] if row else ""
+                        ver = (row[1] or "")[:100] if row else ""
+                        st.success(f"연결 성공 — 현재 DB: `{dbname}`")
+                        if ver:
+                            st.caption(ver)
+                    except Exception as e:
+                        st.error(f"{type(e).__name__}: {e}")
+
         filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([2, 1, 1, 1])
         with filter_col1:
             keyword_like = st.text_input("키워드 필터", value="")
@@ -389,16 +439,18 @@ def run() -> None:
 
         started_from, started_to = _period_to_range(period)
 
-        try:
-            score_rows = query_market_score_rows(
-                limit=int(limit),
-                keyword_like=(keyword_like or "").strip() or None,
-                started_from=started_from,
-                started_to=started_to,
-            )
-        except Exception as e:
-            st.error(f"DB 조회 실패: {e}")
-            score_rows = []
+        score_rows: List[dict] = []
+        if is_dsn_configured():
+            try:
+                score_rows = query_market_score_rows(
+                    limit=int(limit),
+                    keyword_like=(keyword_like or "").strip() or None,
+                    started_from=started_from,
+                    started_to=started_to,
+                )
+            except Exception as e:
+                st.error(f"DB 조회 실패: {e}")
+                score_rows = []
 
         if score_rows:
             score_df = pd.DataFrame(score_rows)
@@ -512,7 +564,8 @@ def run() -> None:
                 width='stretch',
             )
         else:
-            st.info("조회 결과가 없습니다.")
+            if is_dsn_configured():
+                st.info("조회 결과가 없습니다.")
 
     with tab_coupang:
         st.subheader("쿠팡 상품 키워드 분석")
@@ -521,7 +574,7 @@ def run() -> None:
             st.info(
                 "Railway 등 **원격 서버**에서 앱이 실행 중입니다. Playwright Chromium 창은 **서버 쪽**에만 열리고, "
                 "지금 쓰는 브라우저가 있는 **이 PC 화면에는 창이 보이지 않습니다.** "
-                "확인은 아래 **스모크 상태·스크린샷**으로 하시면 됩니다. "
+                "확인은 아래 **스모크 상태**(phase·URL·JSON)로 하시면 됩니다. "
                 "이 PC에서 창까지 보려면 저장소를 받아 로컬에서 `streamlit run app_web.py` 를 실행하세요."
             )
         st.caption(
@@ -593,7 +646,7 @@ def run() -> None:
                     "note": (
                         f"키워드={str(coupang_keyword).strip()!r}, "
                         f"별도 창 유지 최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초. "
-                        "아래 **스모크 상태** 패널에서 phase·스크린샷으로 창/로드 여부를 확인하세요."
+                        "아래 **스모크 상태** 패널에서 phase·URL로 진행 여부를 확인하세요."
                     ),
                 }
 
@@ -623,97 +676,61 @@ def run() -> None:
         smpv = tool.coupang_crawler.get_smoke_playwright_status()
         if str(smpv.get("phase") or "idle") != "idle":
             with st.expander(
-                "Playwright Chromium 스모크 — 창·로드 확인 (phase / 스크린샷)",
+                "Playwright Chromium 스모크 — 창·로드 확인 (phase / 상태)",
                 expanded=bool(smpv.get("thread_alive")),
             ):
-                view = {k: v for k, v in smpv.items() if k not in ("preview_png", "timeline_pngs")}
-                st.json(view)
-                prev = smpv.get("preview_png")
-                if prev:
-                    st.image(
-                        prev,
-                        caption="Chromium 첫 로드 직후 스크린샷 (headless 서버에서도 이 이미지로 확인)",
-                        use_container_width=True,
-                    )
-                elif smpv.get("thread_alive") and smpv.get("phase") not in ("failed", "closed"):
-                    st.caption("스크린샷 대기 중이거나 로드가 느립니다. 잠시 후 **Rerun / 새로고침**으로 다시 확인하세요.")
+                st.json(smpv)
+                if smpv.get("thread_alive") and smpv.get("phase") not in ("failed", "closed", "opened"):
+                    st.caption("로드 중이면 잠시 후 **Rerun / 새로고침**으로 다시 확인하세요.")
 
-                timeline_pngs = smpv.get("timeline_pngs", [])
-                if isinstance(timeline_pngs, list) and timeline_pngs:
-                    st.markdown("**실행 중 캡처 타임라인(메모리):**")
-                    cols = st.columns(len(timeline_pngs))
-                    for i, shot in enumerate(timeline_pngs):
-                        if not isinstance(shot, dict):
-                            continue
-                        img = shot.get("png")
-                        if not img:
-                            continue
-                        tag = str(shot.get("tag", "shot"))
-                        cap = str(shot.get("captured_at", "-"))
-                        with cols[i]:
-                            st.image(img, caption=f"{tag} / {cap}", use_container_width=True)
+        kw_coupang = str(coupang_keyword).strip()
+        coupang_items: List[dict] = []
+        if kw_coupang:
+            if is_dsn_configured():
+                try:
+                    coupang_items = query_coupang_latest_ranked_items(kw_coupang, limit=10)
+                except Exception as ex:
+                    st.caption(f"쿠팡 DB 조회 실패(파일 보조 시도): {ex}")
+                    coupang_items = []
+            if not coupang_items:
+                coupang_items = _smoke_file_fallback_ranked(kw_coupang, limit=10)
 
-        timeline_shots = _read_recent_smoke_screenshots(limit=4)
-        st.markdown("#### 최근 실행 캡처 타임라인 (초기 + 10초 + 20초 + 30초)")
-        if timeline_shots:
-            shot_cols = st.columns(len(timeline_shots))
-            for idx, shot in enumerate(timeline_shots):
-                with shot_cols[idx]:
-                    st.image(
-                        shot["path"],
-                        caption=f"{shot['name']} / {shot['captured_at']}",
-                        use_container_width=True,
-                    )
-        else:
-            st.caption("아직 저장된 스모크 캡처가 없습니다. 키워드 검색 1회 실행 후 다시 확인해주세요.")
-
-        smoke_top3_items = _read_last_smoke_extract_top3()
-        if isinstance(smoke_top3_items, list) and smoke_top3_items:
-            top10_template = pd.DataFrame(
-                [
-                    {
-                        "순위": rank,
-                        "상품명": "",
-                        "가격(원)": "",
-                        "리뷰수": "",
-                        "평점": "",
-                        "배송비": "",
-                        "상품 URL": "",
-                    }
-                    for rank in range(1, 11)
-                ]
-            )
-            for item in smoke_top3_items[:3]:
-                if not isinstance(item, dict):
-                    continue
-                rk = int(item.get("rank") or 0)
-                if rk < 1 or rk > 10:
-                    continue
-                top10_template.at[rk - 1, "상품명"] = str(item.get("title", "")).strip()
-                top10_template.at[rk - 1, "가격(원)"] = str(item.get("price", "")).strip()
-                top10_template.at[rk - 1, "리뷰수"] = str(item.get("review_count", "")).strip()
-                top10_template.at[rk - 1, "평점"] = str(item.get("review_score", "")).strip()
-                top10_template.at[rk - 1, "배송비"] = str(item.get("shipping", "")).strip()
-                top10_template.at[rk - 1, "상품 URL"] = str(item.get("url", "")).strip()
-            st.dataframe(top10_template, width='stretch', hide_index=True)
-            st.caption("스모크에서 추출한 1~3위만 표시합니다. (4~10위는 빈값 유지)")
-        else:
-            top10_template = pd.DataFrame(
-                [
-                    {
-                        "순위": rank,
-                        "상품명": "",
-                        "가격(원)": None,
-                        "리뷰수": None,
-                        "평점": None,
-                        "배송비": "",
-                        "상품 URL": "",
-                    }
-                    for rank in range(1, 11)
-                ]
-            )
-            st.dataframe(top10_template, width='stretch', hide_index=True)
-            st.caption("`.smoke/last_smoke_extract.json`에서 결과를 찾지 못했습니다.")
+        top10_template = pd.DataFrame(
+            [
+                {
+                    "순위": rank,
+                    "상품명": "",
+                    "가격(원)": "",
+                    "리뷰수": "",
+                    "평점": "",
+                    "배송비": "",
+                    "상품 URL": "",
+                }
+                for rank in range(1, 11)
+            ]
+        )
+        by_rank = {int(i["rank"]): i for i in coupang_items if isinstance(i, dict) and i.get("rank")}
+        for rk in range(1, 11):
+            item = by_rank.get(rk)
+            if not item:
+                continue
+            top10_template.at[rk - 1, "상품명"] = str(item.get("title", "")).strip()
+            top10_template.at[rk - 1, "가격(원)"] = str(item.get("price", "")).strip()
+            top10_template.at[rk - 1, "리뷰수"] = str(item.get("review_count", "")).strip()
+            top10_template.at[rk - 1, "평점"] = str(item.get("review_score", "")).strip()
+            top10_template.at[rk - 1, "배송비"] = str(item.get("shipping", "")).strip()
+            top10_template.at[rk - 1, "상품 URL"] = str(item.get("url", "")).strip()
+        st.dataframe(top10_template, width='stretch', hide_index=True)
+        if kw_coupang:
+            if coupang_items:
+                st.caption(
+                    "표시: 현재 입력 키워드로 MariaDB에 저장된 **가장 최근** 검색 결과(최대 10위). "
+                    "DB 미설정 시 같은 키워드의 `.smoke/last_smoke_extract.json` 만 보조 사용합니다."
+                )
+            else:
+                st.caption(
+                    "해당 키워드로 저장된 결과가 없습니다. 검색 실행 후 잠시 뒤 새로고침하거나 DB 연결을 확인하세요."
+                )
         st.caption("표시 컬럼: 순위, 상품명, 가격, 리뷰수, 평점, 배송비, 상품 URL")
 
 

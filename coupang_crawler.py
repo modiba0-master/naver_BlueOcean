@@ -173,8 +173,6 @@ class CoupangCrawler:
             "error": "",
             "top3_items": [],
         }
-        self._smoke_preview_png: Optional[bytes] = None
-        self._smoke_timeline_pngs: List[Dict[str, Any]] = []
         env_raw = str(os.environ.get("COUPANG_HEADLESS", "")).strip().lower()
         if env_raw in {"0", "false", "n", "no"}:
             self._headless = False
@@ -205,12 +203,10 @@ class CoupangCrawler:
             self._smoke_status = {**self._smoke_status, **kwargs}
 
     def get_smoke_playwright_status(self) -> Dict[str, Any]:
-        """대시보드에서 스모크 Chromium 진행 여부 확인용(phase·URL·캡처 등)."""
+        """대시보드에서 스모크 Chromium 진행 여부 확인용(phase·URL 등)."""
         self._maybe_reap_smoke_subprocess()
         with self._io_lock:
             out = dict(self._smoke_status)
-            png = self._smoke_preview_png
-            timeline = list(self._smoke_timeline_pngs)
             sub = self._smoke_subproc
         if sub is not None and sub.poll() is None:
             out = {
@@ -227,10 +223,6 @@ class CoupangCrawler:
             }
             return out
         out["thread_alive"] = self.is_smoke_playwright_running()
-        if png:
-            out["preview_png"] = png
-        if timeline:
-            out["timeline_pngs"] = timeline
         return out
 
     @staticmethod
@@ -336,24 +328,6 @@ class CoupangCrawler:
 
     def _cache_key(self, keyword: str) -> str:
         return f"{keyword.strip()}_{datetime.now().strftime('%Y%m%d')}"
-
-    def _save_smoke_screenshot_file(self, png_bytes: bytes, tag: str) -> Optional[str]:
-        """
-        스모크 캡처 PNG를 .smoke 폴더에 저장한다.
-        파일명 예: smoke_step0_open_20260501_220900.png
-        """
-        try:
-            out_dir = Path(__file__).resolve().parent / ".smoke"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_tag = re.sub(r"[^a-zA-Z0-9_-]", "_", str(tag or "shot"))
-            out_path = out_dir / f"smoke_{safe_tag}_{ts}.png"
-            with open(out_path, "wb") as f:
-                f.write(png_bytes)
-            return str(out_path)
-        except Exception as e:
-            safe_print(f"[SMOKE] 스크린샷 파일 저장 실패(무시): {e!r}")
-            return None
 
     def _fallback_profile_dir(self, prep_profile: bool) -> str:
         suffix = "prep" if prep_profile else "crawl"
@@ -1187,13 +1161,10 @@ class CoupangCrawler:
     def _run_smoke_worker(self, url: str, max_wait_seconds: float, stop_event: threading.Event) -> None:
         """별도 스레드에서 실행. persistent 크롤 세션과 무관한 ephemeral Chromium."""
         target = str(url).strip() or "https://www.google.com/"
-        with self._io_lock:
-            self._smoke_preview_png = None
-            self._smoke_timeline_pngs = []
-        hint_h_env = "headless=True (COUPANG_SMOKE_HEADLESS) — OS 창 없음. 캡처·phase로 확인."
+        hint_h_env = "headless=True (COUPANG_SMOKE_HEADLESS) — OS 창 없음. phase·상태로 확인."
         hint_h_auto = (
             "headless=True — Linux에 DISPLAY가 없어 자동 headless입니다. "
-            "Railway/Docker에서는 스크린샷·phase로만 확인됩니다."
+            "Railway/Docker에서는 phase·상태(JSON)로만 확인됩니다."
         )
         hint_v = (
             "headless=False — Playwright Chromium이 별도 창으로 보여야 합니다 (로컬 Windows 등)."
@@ -1645,7 +1616,7 @@ class CoupangCrawler:
                                             const row = extract(card);
                                             if (row.title && /[\d,]+원/.test(row.price)) organic.push(row);
                                         }
-                                        const top3 = organic.slice(0, 3).map((row, idx) => ({
+                                        const top10 = organic.slice(0, 10).map((row, idx) => ({
                                             rank: idx + 1,
                                             title: row.title,
                                             price: row.price,
@@ -1667,7 +1638,7 @@ class CoupangCrawler:
                                             html_len: html ? html.length : 0,
                                             card_count: cards.length,
                                             organic_count: organic.length,
-                                            top3: top3,
+                                            top10: top10,
                                             sample: sample,
                                         };
                                     }"""
@@ -1695,7 +1666,7 @@ class CoupangCrawler:
                                             raise
                                     if probe is None:
                                         raise last_ev or RuntimeError("HTML probe evaluate failed")
-                                    self._smoke_status_update(top3_items=probe.get("top3", []))
+                                    self._smoke_status_update(top3_items=probe.get("top10", []))
                                     safe_print(
                                         "[SMOKE] HTML probe: "
                                         f"url={probe.get('url','')} "
@@ -1704,7 +1675,7 @@ class CoupangCrawler:
                                         f"card_count={probe.get('card_count',0)} "
                                         f"organic_count={probe.get('organic_count', 0)}"
                                     )
-                                    safe_print(f"[SMOKE] HTML probe top3={probe.get('top3', [])!r}")
+                                    safe_print(f"[SMOKE] HTML probe top10={probe.get('top10', [])!r}")
                                     safe_print(f"[SMOKE] HTML probe sample={probe.get('sample', [])!r}")
                                     smoke_payload = {
                                         "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -1721,7 +1692,7 @@ class CoupangCrawler:
                                         "keyword": search_kw,
                                         "source_type": "smoke",
                                         "error": repr(hp_e),
-                                        "top3": [],
+                                        "top10": [],
                                         "card_count": None,
                                     }
                                     _dump_smoke_extract_report(smoke_payload)
@@ -1730,20 +1701,13 @@ class CoupangCrawler:
                                 safe_print(f"[SMOKE] 쿠팡 검색 자동 시연 단계 실패: {ce2!r}")
                         else:
                             safe_print(
-                                f"[SMOKE] 쿠팡 링크 클릭 단계 건너뜀/실패 — 스크린샷은 현 SERP 기준: {last_pick_err!r}"
+                                f"[SMOKE] 쿠팡 링크 클릭 단계 건너뜀/실패 — 현 SERP 기준으로 진행: {last_pick_err!r}"
                             )
                     except Exception as ce:
-                        safe_print(f"[SMOKE] 마우스 원형/쿠팡 클릭 단계 실패 — 스크린샷만 진행: {ce!r}")
+                        safe_print(f"[SMOKE] 마우스 원형/쿠팡 클릭 단계 실패: {ce!r}")
                 except Exception as se:
-                    safe_print(f"[SMOKE] 구글 검색 단계 실패 — 스크린샷만 진행: {se!r}")
+                    safe_print(f"[SMOKE] 구글 검색 단계 실패: {se!r}")
 
-            try:
-                png = page.screenshot(type="png", full_page=False)
-            except Exception as cap_err:
-                safe_print(f"[SMOKE] 스크린샷 생략: {cap_err!r}")
-                png = None
-            with self._io_lock:
-                self._smoke_preview_png = png
             try:
                 ptitle = page.title()
                 purl = page.url
@@ -1755,47 +1719,10 @@ class CoupangCrawler:
                 page_url=purl,
                 page_title=ptitle,
                 opened_at=time.time(),
-                hint=(
-                    "첫 로드 완료. 초기 1회 + 10초 간격 3회(총 4회) 자동 캡처를 진행합니다."
-                ),
+                hint="첫 로드 완료. 실행 단계를 계속 진행합니다.",
             )
             with self._io_lock:
                 self._last_error = {}
-
-            # 요청 사양: 초기 화면 1회 + 10초 간격 3회 추가 캡처
-            # 총 4장의 캡처를 파일로 남기고, 마지막 캡처를 대시보드 미리보기에 유지한다.
-            shot_plan = [
-                (0, "step0_open"),
-                (10, "step1_10s"),
-                (20, "step2_20s"),
-                (30, "step3_30s"),
-            ]
-            start_ts = time.monotonic()
-            for sec_mark, shot_tag in shot_plan:
-                while (time.monotonic() - start_ts) < float(sec_mark):
-                    if stop_event.is_set():
-                        break
-                    time.sleep(0.2)
-                if stop_event.is_set():
-                    break
-                try:
-                    shot_png = page.screenshot(type="png", full_page=False)
-                    with self._io_lock:
-                        self._smoke_preview_png = shot_png
-                        self._smoke_timeline_pngs.append(
-                            {
-                                "tag": shot_tag,
-                                "captured_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "png": shot_png,
-                            }
-                        )
-                        # 메모리 사용량 보호: 최근 4장만 유지
-                        self._smoke_timeline_pngs = self._smoke_timeline_pngs[-4:]
-                    saved = self._save_smoke_screenshot_file(shot_png, shot_tag)
-                    if saved:
-                        safe_print(f"[SMOKE] 스크린샷 저장: {saved}")
-                except Exception as shot_err:
-                    safe_print(f"[SMOKE] 주기 캡처 실패(무시): {shot_err!r}")
 
             deadline = time.monotonic() + float(max_wait_seconds)
             poll = 0.5
@@ -1841,11 +1768,11 @@ class CoupangCrawler:
     def smoke_open_playwright_chromium_window(
         self,
         url: str = "https://www.google.com/",
-        wait_seconds: float = 300.0,
+        wait_seconds: float = 5.0,
     ) -> bool:
         """
         크롤러 persistent 세션과 별도로 Playwright 번들 Chromium을 별도 창으로 연다.
-        Streamlit 요청을 막지 않도록 백그라운드 스레드에서 최대 wait_seconds 동안 유지한다.
+        Streamlit 요청을 막지 않도록 백그라운드 스레드에서 추출 후 최대 wait_seconds 만큼 유지했다가 닫는다.
         대시보드의 강제 종료 버튼은 stop_smoke_playwright_chromium_window() 로 즉시 닫을 수 있다.
         """
         return self.start_smoke_playwright_chromium_window(url=url, max_wait_seconds=wait_seconds)
@@ -1853,7 +1780,7 @@ class CoupangCrawler:
     def start_smoke_playwright_chromium_window(
         self,
         url: str = "https://www.google.com/",
-        max_wait_seconds: float = 300.0,
+        max_wait_seconds: float = 5.0,
     ) -> bool:
         max_wait_seconds = max(5.0, float(max_wait_seconds))
         target = str(url).strip() or "https://www.google.com/"
@@ -1862,7 +1789,6 @@ class CoupangCrawler:
         with self._io_lock:
             old_thr = self._smoke_thread
             old_ev = self._smoke_stop_event
-            self._smoke_preview_png = None
         if old_ev is not None:
             old_ev.set()
         if old_thr is not None:

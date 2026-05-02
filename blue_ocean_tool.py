@@ -63,6 +63,66 @@ def resource_path(relative_path: str) -> str:
     base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
 
+
+def apply_db_cfg_dict_to_env(db_cfg: Any) -> None:
+    """
+    database 항목(dict)을 os.environ에 반영한다. 이미 설정된 환경변수는 덮어쓰지 않는다.
+    """
+    if not isinstance(db_cfg, dict):
+        return
+
+    mysql_url = str(db_cfg.get("mysql_url", "") or db_cfg.get("mariadb_url", "")).strip()
+    mysql_public_url = str(db_cfg.get("mysql_public_url", "") or "").strip()
+    mariadb_public_url = str(db_cfg.get("mariadb_public_url", "") or "").strip()
+    if mysql_public_url and not (os.environ.get("MYSQL_PUBLIC_URL") or "").strip():
+        os.environ["MYSQL_PUBLIC_URL"] = mysql_public_url
+    if mariadb_public_url and not (os.environ.get("MARIADB_PUBLIC_URL") or "").strip():
+        os.environ["MARIADB_PUBLIC_URL"] = mariadb_public_url
+    if mysql_url and not (
+        (os.environ.get("MYSQL_URL") or "").strip()
+        or (os.environ.get("MYSQL_PUBLIC_URL") or "").strip()
+        or (os.environ.get("MARIADB_PUBLIC_URL") or "").strip()
+        or (os.environ.get("MARIADB_URL") or "").strip()
+        or (os.environ.get("DATABASE_URL") or "").strip()
+        or (os.environ.get("DATABASE_PUBLIC_URL") or "").strip()
+    ):
+        os.environ["MYSQL_URL"] = mysql_url
+
+    mapping = {
+        "host": "MARIADB_HOST",
+        "port": "MARIADB_PORT",
+        "user": "MARIADB_USER",
+        "password": "MARIADB_PASSWORD",
+        "database": "MARIADB_DATABASE",
+    }
+    for key, env_name in mapping.items():
+        value = str(db_cfg.get(key, "")).strip()
+        if value and not (os.environ.get(env_name) or "").strip():
+            os.environ[env_name] = value
+
+
+def apply_database_env_from_config(config_path: str = "config.json") -> None:
+    """
+    config.json + config.local.json의 database 를 합쳐 환경변수로 올린다.
+    같은 키는 config.local.json 이 우선. 이미 설정된 env 는 덮어쓰지 않는다.
+    로컬 DB URL은 git 에 안 올리는 config.local.json 에만 두면 된다.
+    """
+    merged_db: Dict[str, Any] = {}
+    for filename in (config_path, "config.local.json"):
+        resolved = resource_path(filename)
+        if not os.path.isfile(resolved):
+            continue
+        try:
+            with open(resolved, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            continue
+        db = cfg.get("database") or {}
+        if isinstance(db, dict):
+            merged_db.update(db)
+    apply_db_cfg_dict_to_env(merged_db)
+
+
 class NaverSearchAdsAPI:
     def __init__(self, config):
         self.access_license = config['access_license']
@@ -145,34 +205,7 @@ class BlueOceanTool:
         config.json의 database 항목을 환경변수로 보강한다.
         기존 환경변수가 이미 있으면 덮어쓰지 않는다.
         """
-        db_cfg = self.config.get("database", {}) or {}
-        if not isinstance(db_cfg, dict):
-            return
-
-        mysql_url = str(db_cfg.get("mysql_url", "") or db_cfg.get("mariadb_url", "")).strip()
-        mysql_public_url = str(db_cfg.get("mysql_public_url", "") or "").strip()
-        if mysql_public_url and not (os.environ.get("MYSQL_PUBLIC_URL") or "").strip():
-            os.environ["MYSQL_PUBLIC_URL"] = mysql_public_url
-        if mysql_url and not (
-            (os.environ.get("MYSQL_URL") or "").strip()
-            or (os.environ.get("MYSQL_PUBLIC_URL") or "").strip()
-            or (os.environ.get("MARIADB_URL") or "").strip()
-            or (os.environ.get("DATABASE_URL") or "").strip()
-            or (os.environ.get("DATABASE_PUBLIC_URL") or "").strip()
-        ):
-            os.environ["MYSQL_URL"] = mysql_url
-
-        mapping = {
-            "host": "MARIADB_HOST",
-            "port": "MARIADB_PORT",
-            "user": "MARIADB_USER",
-            "password": "MARIADB_PASSWORD",
-            "database": "MARIADB_DATABASE",
-        }
-        for key, env_name in mapping.items():
-            value = str(db_cfg.get(key, "")).strip()
-            if value and not (os.environ.get(env_name) or "").strip():
-                os.environ[env_name] = value
+        apply_db_cfg_dict_to_env(self.config.get("database") or {})
 
     def get_monthly_trends(self, keyword, start_date, end_date):
         """요청된 기간의 월별 트렌드 지수 수집"""
