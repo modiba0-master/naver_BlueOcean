@@ -33,14 +33,15 @@ from report_format import report_to_excel_bytes
 _GOOGLE_HOME_URL = "https://www.google.com/"
 _PLAYWRIGHT_SMOKE_MAX_SECONDS = 5.0
 
+_LAST_SMOKE_JSON_PATH = Path(__file__).resolve().parent / ".smoke" / "last_smoke_extract.json"
+
 
 def _smoke_file_fallback_ranked(keyword: str, limit: int = 10) -> List[dict]:
-    """DB 조회 실패·미설정 시에만: 로컬 JSON에서 같은 키워드의 top10/top3 보조 로드."""
-    p = Path(__file__).resolve().parent / ".smoke" / "last_smoke_extract.json"
-    if not p.is_file():
+    """메모리/DB가 비었을 때 .smoke/last_smoke_extract.json 과 동일 키워드면 순위표 폴백."""
+    if not _LAST_SMOKE_JSON_PATH.is_file():
         return []
     try:
-        with open(p, "r", encoding="utf-8") as f:
+        with open(_LAST_SMOKE_JSON_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             return []
@@ -53,9 +54,15 @@ def _smoke_file_fallback_ranked(keyword: str, limit: int = 10) -> List[dict]:
         for it in items[:limit]:
             if not isinstance(it, dict):
                 continue
+            try:
+                rk = int(it.get("rank") or 0)
+            except Exception:
+                rk = 0
+            if rk < 1:
+                continue
             out.append(
                 {
-                    "rank": int(it.get("rank") or 0),
+                    "rank": rk,
                     "title": str(it.get("title", "")),
                     "price": str(it.get("price", "")),
                     "shipping": str(it.get("shipping", "")),
@@ -64,7 +71,7 @@ def _smoke_file_fallback_ranked(keyword: str, limit: int = 10) -> List[dict]:
                     "url": str(it.get("url", "")),
                 }
             )
-        return [x for x in out if x["rank"] >= 1]
+        return out
     except Exception:
         return []
 
@@ -189,6 +196,96 @@ def _period_to_range(label: str) -> Tuple[Optional[datetime], Optional[datetime]
 def get_tool() -> BlueOceanTool:
     # config.json and env are loaded inside the tool.
     return BlueOceanTool(config_path="config.json")
+
+
+_COUPANG_TABLE_REFRESH_SEC = 2.0
+
+
+@st.fragment(run_every=timedelta(seconds=_COUPANG_TABLE_REFRESH_SEC))
+def _render_coupang_rank_table_live(keyword_text: str) -> None:
+    """스모크 probe 직후 메모리 캐시를 우선 표시하고, DB·JSON 폴백 및 JSON 갱신 시 전체 rerun."""
+    if _LAST_SMOKE_JSON_PATH.is_file():
+        try:
+            mt = _LAST_SMOKE_JSON_PATH.stat().st_mtime
+            prev = st.session_state.get("_last_smoke_extract_mtime")
+            if prev is None:
+                st.session_state["_last_smoke_extract_mtime"] = mt
+            elif mt > float(prev):
+                st.session_state["_last_smoke_extract_mtime"] = mt
+                st.rerun()
+        except OSError:
+            pass
+
+    tool_local = get_tool()
+    kw = str(keyword_text).strip()
+    coupang_items: List[dict] = []
+    from_memory = False
+    from_json_file = False
+    if kw:
+        coupang_items = tool_local.coupang_crawler.get_smoke_ranked_ui_cache(kw)
+        from_memory = bool(coupang_items)
+        if not coupang_items and is_dsn_configured():
+            try:
+                coupang_items = query_coupang_latest_ranked_items(kw, limit=10)
+            except Exception as ex:
+                st.caption(f"쿠팡 DB 조회 실패: {ex}")
+        if not coupang_items:
+            coupang_items = _smoke_file_fallback_ranked(kw, limit=10)
+            from_json_file = bool(coupang_items)
+
+    top10_template = pd.DataFrame(
+        [
+            {
+                "순위": rank,
+                "상품명": "",
+                "가격(원)": "",
+                "리뷰수": "",
+                "평점": "",
+                "배송비": "",
+                "상품 URL": "",
+            }
+            for rank in range(1, 11)
+        ]
+    )
+    by_rank = {int(i["rank"]): i for i in coupang_items if isinstance(i, dict) and i.get("rank")}
+    for rk in range(1, 11):
+        item = by_rank.get(rk)
+        if not item:
+            continue
+        top10_template.at[rk - 1, "상품명"] = str(item.get("title", "")).strip()
+        top10_template.at[rk - 1, "가격(원)"] = str(item.get("price", "")).strip()
+        top10_template.at[rk - 1, "리뷰수"] = str(item.get("review_count", "")).strip()
+        top10_template.at[rk - 1, "평점"] = str(item.get("review_score", "")).strip()
+        top10_template.at[rk - 1, "배송비"] = str(item.get("shipping", "")).strip()
+        top10_template.at[rk - 1, "상품 URL"] = str(item.get("url", "")).strip()
+    st.dataframe(top10_template, width="stretch", hide_index=True)
+
+    if kw:
+        if coupang_items:
+            if from_memory:
+                st.caption(
+                    "표시: 방금 스모크 **메모리 결과**(최대 10위). 같은 내용이 MariaDB 및 `.smoke/last_smoke_extract.json` 에 저장되며, "
+                    "JSON이 갱신되면 전체 화면을 새로고침합니다."
+                )
+            elif from_json_file:
+                st.caption(
+                    "표시: `.smoke/last_smoke_extract.json` 과 입력 키워드가 일치하는 **파일 폴백** 결과(최대 10위)."
+                )
+            else:
+                st.caption("표시: MariaDB에 저장된 해당 키워드 **가장 최근** 결과(최대 10위).")
+        elif tool_local.coupang_crawler.is_smoke_playwright_running():
+            st.caption(
+                "스모크 실행 중입니다. 순위표는 probe 완료 후 수 초 안에 자동으로 채워집니다 "
+                f"(약 {_COUPANG_TABLE_REFRESH_SEC:.0f}초 간격 갱신)."
+            )
+        elif not is_dsn_configured():
+            st.caption(
+                "MariaDB가 설정되지 않았습니다. 스모크 결과는 **메모리에만** 남으며, 페이지를 새로고침하면 사라질 수 있습니다."
+            )
+        else:
+            st.caption(
+                "해당 키워드로 저장된 결과가 없습니다. 검색 실행 후 잠시만 기다리거나 다른 탭으로 갔다 오세요."
+            )
 
 
 @st.cache_data
@@ -683,54 +780,7 @@ def run() -> None:
                 if smpv.get("thread_alive") and smpv.get("phase") not in ("failed", "closed", "opened"):
                     st.caption("로드 중이면 잠시 후 **Rerun / 새로고침**으로 다시 확인하세요.")
 
-        kw_coupang = str(coupang_keyword).strip()
-        coupang_items: List[dict] = []
-        if kw_coupang:
-            if is_dsn_configured():
-                try:
-                    coupang_items = query_coupang_latest_ranked_items(kw_coupang, limit=10)
-                except Exception as ex:
-                    st.caption(f"쿠팡 DB 조회 실패(파일 보조 시도): {ex}")
-                    coupang_items = []
-            if not coupang_items:
-                coupang_items = _smoke_file_fallback_ranked(kw_coupang, limit=10)
-
-        top10_template = pd.DataFrame(
-            [
-                {
-                    "순위": rank,
-                    "상품명": "",
-                    "가격(원)": "",
-                    "리뷰수": "",
-                    "평점": "",
-                    "배송비": "",
-                    "상품 URL": "",
-                }
-                for rank in range(1, 11)
-            ]
-        )
-        by_rank = {int(i["rank"]): i for i in coupang_items if isinstance(i, dict) and i.get("rank")}
-        for rk in range(1, 11):
-            item = by_rank.get(rk)
-            if not item:
-                continue
-            top10_template.at[rk - 1, "상품명"] = str(item.get("title", "")).strip()
-            top10_template.at[rk - 1, "가격(원)"] = str(item.get("price", "")).strip()
-            top10_template.at[rk - 1, "리뷰수"] = str(item.get("review_count", "")).strip()
-            top10_template.at[rk - 1, "평점"] = str(item.get("review_score", "")).strip()
-            top10_template.at[rk - 1, "배송비"] = str(item.get("shipping", "")).strip()
-            top10_template.at[rk - 1, "상품 URL"] = str(item.get("url", "")).strip()
-        st.dataframe(top10_template, width='stretch', hide_index=True)
-        if kw_coupang:
-            if coupang_items:
-                st.caption(
-                    "표시: 현재 입력 키워드로 MariaDB에 저장된 **가장 최근** 검색 결과(최대 10위). "
-                    "DB 미설정 시 같은 키워드의 `.smoke/last_smoke_extract.json` 만 보조 사용합니다."
-                )
-            else:
-                st.caption(
-                    "해당 키워드로 저장된 결과가 없습니다. 검색 실행 후 잠시 뒤 새로고침하거나 DB 연결을 확인하세요."
-                )
+        _render_coupang_rank_table_live(coupang_keyword)
         st.caption("표시 컬럼: 순위, 상품명, 가격, 리뷰수, 평점, 배송비, 상품 URL")
 
 

@@ -37,23 +37,17 @@ def safe_print(*args, **kwargs):
 
 
 def _dump_smoke_extract_report(payload: Dict[str, Any]) -> None:
-    """스모크 HTML 추출 결과를 JSON 파일로 남겨 대시보드 밖에서도 확인 가능하게 한다."""
-    raw = os.environ.get("COUPANG_SMOKE_EXTRACT_JSON")
-    if raw is not None and str(raw).strip().lower() in {"0", "off", "false", "none"}:
+    """스모크 결과를 .smoke/last_smoke_extract.json 에 저장한다 (대시보드 파일 감시·폴백용)."""
+    if not isinstance(payload, dict):
         return
-    if raw and str(raw).strip():
-        out_p = Path(str(raw).strip()).expanduser()
-        if not out_p.is_absolute():
-            out_p = (Path(__file__).resolve().parent / out_p).resolve()
-    else:
-        out_p = Path(__file__).resolve().parent / ".smoke" / "last_smoke_extract.json"
+    out_p = Path(__file__).resolve().parent / ".smoke" / "last_smoke_extract.json"
     try:
         out_p.parent.mkdir(parents=True, exist_ok=True)
         with open(out_p, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        safe_print(f"[SMOKE] 추출 결과 저장: {out_p}")
+        safe_print(f"[SMOKE] 추출 결과 JSON 저장: {out_p}")
     except Exception as ex:
-        safe_print(f"[SMOKE] 추출 결과 파일 저장 실패(무시): {ex!r}")
+        safe_print(f"[SMOKE] 추출 결과 JSON 저장 실패(무시): {ex!r}")
 
 
 def _persist_smoke_extract_report_to_db(payload: Dict[str, Any]) -> None:
@@ -197,6 +191,51 @@ class CoupangCrawler:
         os.makedirs(self._prep_user_data_dir, exist_ok=True)
         if not self._chrome_profile:
             self._chrome_profile = "Default"
+        # 스모크 probe 직후 대시보드에 즉시 반영할 순위표 (같은 프로세스·스레드 공유 전제)
+        self._smoke_ranked_ui_cache: Dict[str, Any] = {"keyword": "", "items": []}
+
+    def _reset_smoke_ranked_ui_cache(self, keyword: str) -> None:
+        kw = str(keyword or "").strip()
+        with self._io_lock:
+            self._smoke_ranked_ui_cache = {"keyword": kw, "items": []}
+
+    def _sync_smoke_ranked_ui_cache_from_payload(self, keyword: str, payload: Dict[str, Any]) -> None:
+        raw = payload.get("top10") or payload.get("top3") or []
+        items_norm: List[Dict[str, Any]] = []
+        if isinstance(raw, list):
+            for it in raw:
+                if not isinstance(it, dict):
+                    continue
+                try:
+                    rk = int(it.get("rank") or 0)
+                except Exception:
+                    rk = 0
+                if rk < 1:
+                    continue
+                items_norm.append(
+                    {
+                        "rank": rk,
+                        "title": str(it.get("title", "")),
+                        "price": str(it.get("price", "")),
+                        "shipping": str(it.get("shipping", "")),
+                        "review_count": str(it.get("review_count", "")),
+                        "review_score": str(it.get("review_score", "")),
+                        "url": str(it.get("url", "")),
+                    }
+                )
+        items_norm.sort(key=lambda x: x["rank"])
+        kw = str(keyword or "").strip()
+        with self._io_lock:
+            self._smoke_ranked_ui_cache = {"keyword": kw, "items": items_norm}
+
+    def get_smoke_ranked_ui_cache(self, keyword: str) -> List[Dict[str, Any]]:
+        kw = str(keyword or "").strip()
+        if not kw:
+            return []
+        with self._io_lock:
+            if self._smoke_ranked_ui_cache.get("keyword", "").strip() != kw:
+                return []
+            return list(self._smoke_ranked_ui_cache.get("items") or [])
 
     def _smoke_status_update(self, **kwargs: Any) -> None:
         with self._io_lock:
@@ -1457,6 +1496,13 @@ class CoupangCrawler:
                                 except Exception:
                                     safe_print("[SMOKE] 상품 리스트 DOM 대기 타임아웃 — probe는 계속 시도")
                                 page.wait_for_timeout(500)
+                                # 검색 결과 초기에는 카드가 적게 잡힐 수 있어 스크롤로 더 많은 li를 로드한 뒤 probe
+                                try:
+                                    for _scroll_i in range(5):
+                                        page.mouse.wheel(0, 1400)
+                                        page.wait_for_timeout(280)
+                                except Exception as sc_e:
+                                    safe_print(f"[SMOKE] 결과 스크롤 생략: {sc_e!r}")
                                 self._smoke_status_update(
                                     phase="smoke_coupang_search_done",
                                     hint=f"쿠팡 검색 실행 완료: {search_kw!r}",
@@ -1587,7 +1633,8 @@ class CoupangCrawler:
                                         };
                                         const cards = Array.from(document.querySelectorAll(
                                             "li.ProductUnit_productUnit__Qd6sv, li.search-product, "
-                                            + "ul#product-list > li, ul#productList li, li[data-product-id]"
+                                            + "ul#product-list > li, ul#productList li, li[data-product-id], "
+                                            + "li[class*='ProductUnit'], li[class*='productUnit']"
                                         ));
                                         const isAd = (card) => {
                                             if (card.querySelector(
@@ -1599,7 +1646,9 @@ class CoupangCrawler:
                                         };
                                         const extract = (card) => {
                                             const titleEl = card.querySelector(
-                                                ".ProductUnit_productNameV2__cV9cw, .name"
+                                                ".ProductUnit_productNameV2__cV9cw, .name, "
+                                                + "a[class*='productName'], [class*='productName'], "
+                                                + "dd.descriptions a, .product-name"
                                             );
                                             return {
                                                 title: text(titleEl),
@@ -1611,10 +1660,17 @@ class CoupangCrawler:
                                             };
                                         };
                                         const organic = [];
+                                        const seenUrls = new Set();
                                         for (const card of cards) {
                                             if (isAd(card)) continue;
                                             const row = extract(card);
-                                            if (row.title && /[\d,]+원/.test(row.price)) organic.push(row);
+                                            const tn = norm(row.title);
+                                            if (tn.length < 4) continue;
+                                            const u = norm(row.url);
+                                            if (u && seenUrls.has(u)) continue;
+                                            if (u) seenUrls.add(u);
+                                            organic.push(row);
+                                            if (organic.length >= 18) break;
                                         }
                                         const top10 = organic.slice(0, 10).map((row, idx) => ({
                                             rank: idx + 1,
@@ -1683,8 +1739,9 @@ class CoupangCrawler:
                                         "source_type": "smoke",
                                         **probe,
                                     }
-                                    _dump_smoke_extract_report(smoke_payload)
+                                    self._sync_smoke_ranked_ui_cache_from_payload(search_kw, smoke_payload)
                                     _persist_smoke_extract_report_to_db(smoke_payload)
+                                    _dump_smoke_extract_report(smoke_payload)
                                 except Exception as hp_e:
                                     safe_print(f"[SMOKE] HTML probe 실패(무시): {hp_e!r}")
                                     smoke_payload = {
@@ -1695,8 +1752,9 @@ class CoupangCrawler:
                                         "top10": [],
                                         "card_count": None,
                                     }
-                                    _dump_smoke_extract_report(smoke_payload)
+                                    self._sync_smoke_ranked_ui_cache_from_payload(search_kw, smoke_payload)
                                     _persist_smoke_extract_report_to_db(smoke_payload)
+                                    _dump_smoke_extract_report(smoke_payload)
                             except Exception as ce2:
                                 safe_print(f"[SMOKE] 쿠팡 검색 자동 시연 단계 실패: {ce2!r}")
                         else:
@@ -1795,6 +1853,12 @@ class CoupangCrawler:
             old_thr.join(timeout=20.0)
 
         self._terminate_smoke_subprocess_if_any()
+
+        with self._io_lock:
+            # 스모크 시작 시 이전 crawl_coupang 등에서 남은 PLAYWRIGHT_* 오류가 prep에 섞이지 않게 비운다.
+            self._last_error = {}
+
+        self._reset_smoke_ranked_ui_cache(str(os.environ.get("COUPANG_SMOKE_COUPANG_QUERY", "")).strip())
 
         self._smoke_status_update(
             phase="queued",
