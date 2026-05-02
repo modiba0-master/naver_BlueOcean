@@ -122,7 +122,17 @@ _PRODUCT_LIST_SELECTOR = (
     "li.search-product, "
     "li.ProductUnit_productUnit__Qd6sv, "
     "li[data-product-id], "
-    "ul#product-list > li"
+    "ul#product-list > li, "
+    "ul#productList > li, "
+    "li[class*='ProductUnit'], "
+    "li[class*='productUnit']"
+)
+
+# BeautifulSoup 파싱 시 동일 범위의 카드 후보(CSS OR)
+_PRODUCT_CARD_HTML_SELECTOR = (
+    "li.ProductUnit_productUnit__Qd6sv, li.search-product, "
+    "ul#product-list > li, ul#productList > li, li[data-product-id], "
+    "li[class*='ProductUnit'], li[class*='productUnit']"
 )
 
 HEADLESS = True
@@ -165,7 +175,7 @@ class CoupangCrawler:
             "closed_at": None,
             "hint": "",
             "error": "",
-            "top3_items": [],
+            "top10_items": [],
         }
         env_raw = str(os.environ.get("COUPANG_HEADLESS", "")).strip().lower()
         if env_raw in {"0", "false", "n", "no"}:
@@ -239,13 +249,20 @@ class CoupangCrawler:
 
     def _smoke_status_update(self, **kwargs: Any) -> None:
         with self._io_lock:
-            self._smoke_status = {**self._smoke_status, **kwargs}
+            merged = {**self._smoke_status, **kwargs}
+            if "top10_items" in merged:
+                merged["top3_items"] = merged["top10_items"]
+            elif "top3_items" in merged and "top10_items" not in merged:
+                merged["top10_items"] = merged["top3_items"]
+            self._smoke_status = merged
 
     def get_smoke_playwright_status(self) -> Dict[str, Any]:
         """대시보드에서 스모크 Chromium 진행 여부 확인용(phase·URL 등)."""
         self._maybe_reap_smoke_subprocess()
         with self._io_lock:
             out = dict(self._smoke_status)
+            if "top10_items" not in out and out.get("top3_items") is not None:
+                out["top10_items"] = out["top3_items"]
             sub = self._smoke_subproc
         if sub is not None and sub.poll() is None:
             out = {
@@ -553,6 +570,96 @@ class CoupangCrawler:
         ]
         return any(sig in text for sig in blocked_signals)
 
+    @staticmethod
+    def _organic_rank_from_rank_mark_li(li: Any) -> Optional[int]:
+        """
+        카드 내 RankMark_rank{N}__* 클래스에서 쿠팡이 표시하는 실제 순위(N)를 읽는다.
+        광고 카드에는 보통 부착되지 않아 광고와 혼동을 줄인다.
+        """
+        for el in li.select("[class*='RankMark_rank']"):
+            classes = el.get("class") or []
+            if isinstance(classes, str):
+                classes = classes.split()
+            for cl in classes:
+                if not isinstance(cl, str):
+                    continue
+                m = re.search(r"RankMark_rank(\d+)__", cl)
+                if m:
+                    try:
+                        r = int(m.group(1))
+                        if 1 <= r <= 10:
+                            return r
+                    except ValueError:
+                        continue
+        return None
+
+    def _extract_product_fields_from_li(self, li: Any) -> Optional[Dict[str, Any]]:
+        """단일 상품 카드(li)에서 파싱 공통 필드 추출. 실패 시 None."""
+        title_node = li.select_one(".ProductUnit_productNameV2__cV9cw, .name")
+        price_raw = self._pick_price_won_from_li(li)
+        review_count_node = li.select_one(
+            ".ProductRating_productRating__jjf7W [class*='fw-text-'], "
+            ".rating-total-count, .rating-count, .count"
+        )
+        review_score_node = li.select_one(
+            ".ProductRating_productRating__jjf7W [aria-label], "
+            ".ProductRating_productRating__jjf7W em, "
+            ".ProductRating_productRating__jjf7W strong, "
+            ".ProductRating_productRating__jjf7W [class*='rating'], "
+            ".star .rating"
+        )
+        link_node = (
+            li.select_one("a[href*='vp/products']")
+            or li.select_one("a[href*='/products/']")
+            or li.select_one("a[href*='www.coupang.com/vp/']")
+            or li.select_one("a[href^='/vp/products']")
+            or li.select_one("a[href]")
+        )
+
+        title = title_node.get_text(strip=True) if title_node else ""
+        review_count_raw = review_count_node.get_text(strip=True) if review_count_node else ""
+        review_score_raw = ""
+        if review_score_node is not None:
+            review_score_raw = str(
+                review_score_node.get("aria-label", "") or review_score_node.get_text(strip=True) or ""
+            )
+        shipping_fee_raw = self._pick_shipping_from_li(li)
+        price_num = self._parse_int(price_raw)
+        review_num = self._parse_int(self._normalize_review_count_display(review_count_raw))
+        review_score = self._parse_float(review_score_raw)
+        url = ""
+        if link_node is not None:
+            href = str(link_node.get("href", "")).strip()
+            if href.startswith("http"):
+                url = href
+            elif href.startswith("/"):
+                url = f"https://www.coupang.com{href}"
+
+        if not title or price_num is None:
+            return None
+        return {
+            "title": title,
+            "price": float(price_num),
+            "review_count": float(review_num) if review_num is not None else None,
+            "review_score": float(review_score) if review_score is not None else None,
+            "shipping_fee": shipping_fee_raw or None,
+            "url": url,
+        }
+
+    def _li_is_ad_card(self, li: Any) -> bool:
+        is_ad = bool(
+            li.select_one(
+                ".search-product__ad-badge, .search-product__ad, .ad-badge-text, "
+                "[data-badge-type='ad'], [class*='AdMark'], [class*='adBadge']"
+            )
+        )
+        if not is_ad:
+            li_text = li.get_text(" ", strip=True)
+            has_rank_mark = li.select_one("[class*='RankMark_rank']") is not None
+            if "광고" in li_text and not has_rank_mark:
+                is_ad = True
+        return bool(is_ad)
+
     def _parse_top10_from_html(self, html: str) -> tuple[int, List[Dict[str, Any]]]:
         parser = "lxml"
         try:
@@ -560,80 +667,39 @@ class CoupangCrawler:
         except Exception:
             soup = BeautifulSoup(html, "html.parser")
 
-        products = soup.select("li.ProductUnit_productUnit__Qd6sv")
-        if not products:
-            products = soup.select("li.search-product")
-        if not products:
-            products = soup.select("ul#product-list > li")
+        products = soup.select(_PRODUCT_CARD_HTML_SELECTOR)
         items: List[Dict[str, Any]] = []
+
+        # 1) RankMark_rank{N}__ 기준으로 1~10위만 명시적으로 매칭 (광고 제외)
+        by_rank: Dict[int, Dict[str, Any]] = {}
+        for li in products:
+            rk = self._organic_rank_from_rank_mark_li(li)
+            if rk is None:
+                continue
+            if self._li_is_ad_card(li):
+                continue
+            fields = self._extract_product_fields_from_li(li)
+            if fields is None:
+                continue
+            if rk not in by_rank:
+                by_rank[rk] = {"rank": rk, **fields}
+
+        if by_rank:
+            for r in range(1, 11):
+                if r in by_rank:
+                    items.append(by_rank[r])
+            return len(products), items
+
+        # 2) RankMark 없는 레이아웃 폴백: 비광고 카드 순서대로 1..10 부여
         rank_no = 0
         for li in products:
-            is_ad = bool(
-                li.select_one(
-                    ".search-product__ad-badge, .search-product__ad, .ad-badge-text"
-                )
-            )
-            if not is_ad:
-                li_text = li.get_text(" ", strip=True)
-                has_rank_mark = li.select_one("[class*='RankMark_rank']") is not None
-                if "광고" in li_text and not has_rank_mark:
-                    is_ad = True
-            if is_ad:
+            if self._li_is_ad_card(li):
                 continue
-            title_node = li.select_one(".ProductUnit_productNameV2__cV9cw, .name")
-            price_raw = self._pick_price_won_from_li(li)
-            review_count_node = li.select_one(
-                ".ProductRating_productRating__jjf7W [class*='fw-text-'], "
-                ".rating-total-count, .rating-count, .count"
-            )
-            review_score_node = li.select_one(
-                ".ProductRating_productRating__jjf7W [aria-label], "
-                ".ProductRating_productRating__jjf7W em, "
-                ".ProductRating_productRating__jjf7W strong, "
-                ".ProductRating_productRating__jjf7W [class*='rating'], "
-                ".star .rating"
-            )
-            link_node = (
-                li.select_one("a[href*='vp/products']")
-                or li.select_one("a[href*='/products/']")
-                or li.select_one("a[href*='www.coupang.com/vp/']")
-                or li.select_one("a[href^='/vp/products']")
-                or li.select_one("a[href]")
-            )
-
-            title = title_node.get_text(strip=True) if title_node else ""
-            review_count_raw = review_count_node.get_text(strip=True) if review_count_node else ""
-            review_score_raw = ""
-            if review_score_node is not None:
-                review_score_raw = str(
-                    review_score_node.get("aria-label", "") or review_score_node.get_text(strip=True) or ""
-                )
-            shipping_fee_raw = self._pick_shipping_from_li(li)
-            price_num = self._parse_int(price_raw)
-            review_num = self._parse_int(self._normalize_review_count_display(review_count_raw))
-            review_score = self._parse_float(review_score_raw)
-            url = ""
-            if link_node is not None:
-                href = str(link_node.get("href", "")).strip()
-                if href.startswith("http"):
-                    url = href
-                elif href.startswith("/"):
-                    url = f"https://www.coupang.com{href}"
-
-            if not title or price_num is None:
+            fields = self._extract_product_fields_from_li(li)
+            if fields is None:
                 continue
             rank_no += 1
-            items.append(
-                {
-                    "rank": rank_no,
-                    "title": title,
-                    "price": float(price_num),
-                    "review_count": float(review_num) if review_num is not None else None,
-                    "review_score": float(review_score) if review_score is not None else None,
-                    "shipping_fee": shipping_fee_raw or None,
-                    "url": url,
-                }
-            )
+            items.append({"rank": rank_no, **fields})
             if len(items) >= 10:
                 break
         return len(products), items
@@ -780,6 +846,25 @@ class CoupangCrawler:
             page.wait_for_timeout(random.randint(300, 700))
         except Exception:
             return
+
+    def _scroll_coupang_search_results_page(self, page: Page, *, max_wheel_batches: int = 14) -> None:
+        """
+        검색 결과 상품 카드가 지연 로드되므로 마우스 휠과 페이지 하단 스크롤로 DOM을 채운 뒤 1~10위 추출을 한다.
+        스모크 probe와 동일한 패턴을 공유한다.
+        """
+        try:
+            page.wait_for_timeout(300)
+            for i in range(max(1, int(max_wheel_batches))):
+                page.mouse.wheel(0, 1600)
+                page.wait_for_timeout(220)
+                if i % 4 == 3:
+                    try:
+                        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(350)
+                    except Exception:
+                        pass
+        except Exception as ex:
+            safe_print(f"[Crawler] 검색 결과 스크롤 생략: {ex!r}")
 
     def _accept_google_consent_if_present(self, page: Page) -> None:
         """
@@ -1070,8 +1155,13 @@ class CoupangCrawler:
                 self._simulate_human_actions(page)
 
                 req_result = self._requests_with_browser_session(page, url)
-                if req_result is not None:
+                req_n = len((req_result or {}).get("top10_items") or [])
+                if req_result is not None and req_n >= 10:
                     return req_result
+                if req_result is not None and req_n < 10:
+                    safe_print(
+                        f"[Crawler][playwright] requests 비광고 {req_n}개만 확보 — 페이지 스크롤 후 DOM으로 10위까지 재시도"
+                    )
 
                 page.wait_for_selector(_PRODUCT_LIST_SELECTOR, timeout=12000)
                 page.wait_for_timeout(random.randint(900, 1600))
@@ -1079,6 +1169,7 @@ class CoupangCrawler:
                     f"[Crawler][playwright] ready keyword={keyword} "
                     f"title={page.title()[:80]} url={page.url}"
                 )
+                self._scroll_coupang_search_results_page(page)
                 html = page.content()
                 if self._is_blocked(html, page.title()):
                     safe_print("[WAF_BLOCK][playwright] blocked signal detected before parsing")
@@ -1087,16 +1178,37 @@ class CoupangCrawler:
                 product_count, items = self._parse_top10_from_html(html)
                 safe_print(
                     f"[Crawler][playwright] parsed keyword={keyword} "
-                    f"product_count={product_count} top10_items={len(items)}"
+                    f"product_count={product_count} top10_items={len(items)} (after scroll)"
                 )
-                if product_count <= 0:
+                if len(items) < 10:
+                    self._scroll_coupang_search_results_page(page, max_wheel_batches=12)
+                    page.wait_for_timeout(random.randint(400, 900))
+                    html2 = page.content()
+                    if not self._is_blocked(html2, page.title()):
+                        pc2, items2 = self._parse_top10_from_html(html2)
+                        if len(items2) > len(items):
+                            product_count, items = pc2, items2
+                            safe_print(
+                                f"[Crawler][playwright] second pass keyword={keyword} "
+                                f"product_count={product_count} top10_items={len(items)}"
+                            )
+
+                dom_n = len(items)
+                if dom_n == 0 and req_result is None:
                     self._last_error = {
                         "code": "PLAYWRIGHT_NO_PRODUCTS",
                         "message": "playwright parse returned zero products",
                     }
                     return None
+                if dom_n == 0:
+                    self._last_fetch_source = "requests"
+                    return req_result
+                built_dom = self._build_result(product_count, items)
+                if req_result is not None and req_n > dom_n:
+                    self._last_fetch_source = "requests"
+                    return req_result
                 self._last_fetch_source = "playwright"
-                return self._build_result(product_count, items)
+                return built_dom
             except TimeoutError as e:
                 safe_print(f"[Crawler Error] keyword={keyword}, error=timeout, detail={e}")
                 self._last_error = {
@@ -1216,7 +1328,7 @@ class CoupangCrawler:
             opened_at=None,
             closed_at=None,
             error="",
-            top3_items=[],
+            top10_items=[],
             hint="브라우저 기동 중…",
         )
         self._sanitize_playwright_browser_env()
@@ -1344,29 +1456,36 @@ class CoupangCrawler:
                     )
                     safe_print(f"[SMOKE] 구글 검색 실행 완료 query={google_query!r}")
 
-                    # 검색 결과 화면에서 마우스를 한 바퀴 움직인 뒤 쿠팡 공식 도메인 링크 클릭 (headed 시각 확인용)
+                    # 원형 마우스 이동은 시연용. 기본 켜짐. 끄려면 COUPANG_SMOKE_MOUSE_DEMO=0 (또는 coupang_smoke_mouse_demo=0).
+                    _raw_mouse = (
+                        os.environ.get("COUPANG_SMOKE_MOUSE_DEMO")
+                        or os.environ.get("coupang_smoke_mouse_demo")
+                        or "1"
+                    )
+                    _mouse_demo = str(_raw_mouse).strip().lower() not in {"0", "false", "no", "off", "n"}
                     try:
-                        self._smoke_status_update(
-                            phase="smoke_mouse_circle",
-                            hint="검색 결과 창 안에서 마우스 포인터를 원형으로 한 바퀴 이동합니다.",
-                        )
-                        vp = page.viewport_size or {"width": 1280, "height": 900}
-                        vw = float(vp.get("width", 1280))
-                        vh = float(vp.get("height", 900))
-                        cx = vw / 2.0
-                        cy = vh / 2.0
-                        radius = min(vw, vh) * 0.22
-                        steps = 52
-                        page.mouse.move(cx + radius, cy)
-                        page.wait_for_timeout(40)
-                        for _i in range(1, steps + 1):
-                            ang = (2.0 * math.pi * _i) / steps
-                            page.mouse.move(
-                                cx + radius * math.cos(ang),
-                                cy + radius * math.sin(ang),
+                        if _mouse_demo:
+                            self._smoke_status_update(
+                                phase="smoke_mouse_circle",
+                                hint="검색 결과 창 안에서 마우스 포인터를 원형으로 한 바퀴 이동합니다.",
                             )
-                            page.wait_for_timeout(12)
-                        page.wait_for_timeout(200)
+                            vp = page.viewport_size or {"width": 1280, "height": 900}
+                            vw = float(vp.get("width", 1280))
+                            vh = float(vp.get("height", 900))
+                            cx = vw / 2.0
+                            cy = vh / 2.0
+                            radius = min(vw, vh) * 0.22
+                            steps = 52
+                            page.mouse.move(cx + radius, cy)
+                            page.wait_for_timeout(40)
+                            for _i in range(1, steps + 1):
+                                ang = (2.0 * math.pi * _i) / steps
+                                page.mouse.move(
+                                    cx + radius * math.cos(ang),
+                                    cy + radius * math.sin(ang),
+                                )
+                                page.wait_for_timeout(12)
+                            page.wait_for_timeout(200)
 
                         self._smoke_status_update(
                             phase="smoke_find_coupang_link",
@@ -1412,31 +1531,33 @@ class CoupangCrawler:
                             )
                             safe_print("[SMOKE] 검색 결과에서 쿠팡 링크 클릭 후 로드까지 완료")
 
-                            # 쿠팡 진입 후 마우스 원형 2바퀴 + 검색창 2회 클릭 + 검색어 입력 + Enter
+                            # 쿠팡 진입 후 검색까지 (마우스 원형 시연은 기본 켜짐·환경변수로만 끔)
                             try:
-                                self._smoke_status_update(
-                                    phase="smoke_coupang_mouse_circle",
-                                    hint="쿠팡 화면 안에서 마우스 포인터를 원형으로 2바퀴 이동합니다.",
-                                )
-                                page.wait_for_timeout(700)
-                                vp2 = page.viewport_size or {"width": 1280, "height": 900}
-                                vw2 = float(vp2.get("width", 1280))
-                                vh2 = float(vp2.get("height", 900))
-                                cx2 = vw2 / 2.0
-                                cy2 = vh2 / 2.0
-                                radius2 = min(vw2, vh2) * 0.20
-                                turns = 2
-                                steps2 = 52 * turns
-                                page.mouse.move(cx2 + radius2, cy2)
-                                page.wait_for_timeout(40)
-                                for _j in range(1, steps2 + 1):
-                                    ang2 = (2.0 * math.pi * _j) / 52.0
-                                    page.mouse.move(
-                                        cx2 + radius2 * math.cos(ang2),
-                                        cy2 + radius2 * math.sin(ang2),
+                                page.wait_for_timeout(400)
+                                if _mouse_demo:
+                                    self._smoke_status_update(
+                                        phase="smoke_coupang_mouse_circle",
+                                        hint="쿠팡 화면 안에서 마우스 포인터를 원형으로 2바퀴 이동합니다.",
                                     )
-                                    page.wait_for_timeout(10)
-                                page.wait_for_timeout(220)
+                                    page.wait_for_timeout(300)
+                                    vp2 = page.viewport_size or {"width": 1280, "height": 900}
+                                    vw2 = float(vp2.get("width", 1280))
+                                    vh2 = float(vp2.get("height", 900))
+                                    cx2 = vw2 / 2.0
+                                    cy2 = vh2 / 2.0
+                                    radius2 = min(vw2, vh2) * 0.20
+                                    turns = 2
+                                    steps2 = 52 * turns
+                                    page.mouse.move(cx2 + radius2, cy2)
+                                    page.wait_for_timeout(40)
+                                    for _j in range(1, steps2 + 1):
+                                        ang2 = (2.0 * math.pi * _j) / 52.0
+                                        page.mouse.move(
+                                            cx2 + radius2 * math.cos(ang2),
+                                            cy2 + radius2 * math.sin(ang2),
+                                        )
+                                        page.wait_for_timeout(10)
+                                    page.wait_for_timeout(220)
 
                                 _raw_cq = os.environ.get("COUPANG_SMOKE_COUPANG_QUERY")
                                 search_kw = "그램 노트북" if _raw_cq is None else str(_raw_cq).strip()
@@ -1487,22 +1608,14 @@ class CoupangCrawler:
                                     pass
                                 page.wait_for_timeout(600)
                                 try:
-                                    page.wait_for_selector(
-                                        "li.ProductUnit_productUnit__Qd6sv, li.search-product, "
-                                        "ul#product-list > li, ul#productList li, li[data-product-id]",
-                                        timeout=22000,
-                                        state="attached",
-                                    )
+                                    page.wait_for_selector(_PRODUCT_LIST_SELECTOR, timeout=22000, state="attached")
                                 except Exception:
                                     safe_print("[SMOKE] 상품 리스트 DOM 대기 타임아웃 — probe는 계속 시도")
                                 page.wait_for_timeout(500)
-                                # 검색 결과 초기에는 카드가 적게 잡힐 수 있어 스크롤로 더 많은 li를 로드한 뒤 probe
-                                try:
-                                    for _scroll_i in range(5):
-                                        page.mouse.wheel(0, 1400)
-                                        page.wait_for_timeout(280)
-                                except Exception as sc_e:
-                                    safe_print(f"[SMOKE] 결과 스크롤 생략: {sc_e!r}")
+                                # 광고 제외 1~10위 추출 전: 지연 로드 카드를 위해 마우스 스크롤·하단 이동
+                                self._scroll_coupang_search_results_page(page)
+                                page.wait_for_timeout(400)
+                                self._scroll_coupang_search_results_page(page, max_wheel_batches=10)
                                 self._smoke_status_update(
                                     phase="smoke_coupang_search_done",
                                     hint=f"쿠팡 검색 실행 완료: {search_kw!r}",
@@ -1659,29 +1772,77 @@ class CoupangCrawler:
                                                 url: pickProductUrl(card),
                                             };
                                         };
-                                        const organic = [];
-                                        const seenUrls = new Set();
+                                        const rankFromCard = (card) => {
+                                            const nodes = card.querySelectorAll("[class*='RankMark_rank']");
+                                            for (let ri = 0; ri < nodes.length; ri++) {
+                                                const el = nodes[ri];
+                                                const cls = el.className || "";
+                                                const parts = (typeof cls === "string" ? cls : "").split(/\s+/);
+                                                for (let pj = 0; pj < parts.length; pj++) {
+                                                    const mm = parts[pj].match(/^RankMark_rank(\d+)__/);
+                                                    if (mm) {
+                                                        const rv = parseInt(mm[1], 10);
+                                                        if (rv >= 1 && rv <= 10) return rv;
+                                                    }
+                                                }
+                                            }
+                                            return null;
+                                        };
+                                        const byRank = {};
+                                        const seenUrlsRank = new Set();
                                         for (const card of cards) {
+                                            const rk = rankFromCard(card);
+                                            if (rk === null) continue;
                                             if (isAd(card)) continue;
                                             const row = extract(card);
                                             const tn = norm(row.title);
                                             if (tn.length < 4) continue;
                                             const u = norm(row.url);
-                                            if (u && seenUrls.has(u)) continue;
-                                            if (u) seenUrls.add(u);
-                                            organic.push(row);
-                                            if (organic.length >= 18) break;
+                                            const dedupeKey = rk + "|" + u;
+                                            if (u && seenUrlsRank.has(dedupeKey)) continue;
+                                            if (u) seenUrlsRank.add(dedupeKey);
+                                            if (!(rk in byRank)) {
+                                                byRank[rk] = {
+                                                    rank: rk,
+                                                    title: row.title,
+                                                    price: row.price,
+                                                    shipping: row.shipping,
+                                                    review_count: row.review_count,
+                                                    review_score: row.review_score,
+                                                    url: row.url,
+                                                };
+                                            }
                                         }
-                                        const top10 = organic.slice(0, 10).map((row, idx) => ({
-                                            rank: idx + 1,
-                                            title: row.title,
-                                            price: row.price,
-                                            shipping: row.shipping,
-                                            review_count: row.review_count,
-                                            review_score: row.review_score,
-                                            url: row.url,
-                                        }));
-                                        const sample = organic.slice(0, 5).map((row) => ({
+                                        let top10 = [];
+                                        for (let r = 1; r <= 10; r++) {
+                                            if (byRank[r]) top10.push(byRank[r]);
+                                        }
+                                        let organic_count = Object.keys(byRank).length;
+                                        if (organic_count === 0) {
+                                            const organic = [];
+                                            const seenUrls = new Set();
+                                            for (const card of cards) {
+                                                if (isAd(card)) continue;
+                                                const row = extract(card);
+                                                const tn = norm(row.title);
+                                                if (tn.length < 4) continue;
+                                                const u = norm(row.url);
+                                                if (u && seenUrls.has(u)) continue;
+                                                if (u) seenUrls.add(u);
+                                                organic.push(row);
+                                            }
+                                            organic_count = organic.length;
+                                            top10 = organic.slice(0, 10).map((row, idx) => ({
+                                                rank: idx + 1,
+                                                title: row.title,
+                                                price: row.price,
+                                                shipping: row.shipping,
+                                                review_count: row.review_count,
+                                                review_score: row.review_score,
+                                                url: row.url,
+                                            }));
+                                        }
+                                        const sample = top10.slice(0, 5).map((row) => ({
                                             name: row.title,
                                             price: row.price,
                                             review_score: row.review_score,
@@ -1722,7 +1883,22 @@ class CoupangCrawler:
                                             raise
                                     if probe is None:
                                         raise last_ev or RuntimeError("HTML probe evaluate failed")
-                                    self._smoke_status_update(top3_items=probe.get("top10", []))
+                                    _t10 = list(probe.get("top10") or [])
+                                    if len(_t10) < 10:
+                                        safe_print(
+                                            f"[SMOKE] 비광고 {len(_t10)}개만 확보됨 — 추가 스크롤 후 probe 1회 재시도"
+                                        )
+                                        self._scroll_coupang_search_results_page(page, max_wheel_batches=12)
+                                        page.wait_for_timeout(450)
+                                        try:
+                                            probe2 = page.evaluate(_probe_js)
+                                            if isinstance(probe2, dict):
+                                                t2 = list(probe2.get("top10") or [])
+                                                if len(t2) > len(_t10):
+                                                    probe = probe2
+                                        except Exception as re_e:
+                                            safe_print(f"[SMOKE] probe 재시도 생략: {re_e!r}")
+                                    self._smoke_status_update(top10_items=list(probe.get("top10") or []))
                                     safe_print(
                                         "[SMOKE] HTML probe: "
                                         f"url={probe.get('url','')} "
@@ -1969,8 +2145,29 @@ class CoupangCrawler:
 _shared_crawler: Optional[CoupangCrawler] = None
 
 
-def get_shared_crawler() -> CoupangCrawler:
+def get_shared_crawler(*, _internal_reload_done: bool = False) -> CoupangCrawler:
+    """프로세스 전역 단일 크롤러. 스테일 인스턴스·구버전 클래스면 모듈을 reload 후 한 번만 재귀한다."""
     global _shared_crawler
+    import importlib
+    import sys
+
+    # 인스턴스·클래스 어느 쪽이든 메서드 없으면 스테일로 간주 (Streamlit이 coupang_crawler 모듈을 다시 안 읽는 경우)
+    stale = False
+    if _shared_crawler is not None:
+        stale = not hasattr(_shared_crawler, "get_smoke_ranked_ui_cache") or not hasattr(
+            type(_shared_crawler), "get_smoke_ranked_ui_cache"
+        )
+    if stale:
+        try:
+            _shared_crawler.close()
+        except Exception:
+            pass
+        _shared_crawler = None
+        mod = sys.modules.get(__name__)
+        if mod is not None and not _internal_reload_done:
+            importlib.reload(mod)
+            return mod.get_shared_crawler(_internal_reload_done=True)
+
     if _shared_crawler is None:
         _shared_crawler = CoupangCrawler()
     return _shared_crawler

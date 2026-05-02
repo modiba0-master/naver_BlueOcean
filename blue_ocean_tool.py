@@ -170,7 +170,6 @@ class BlueOceanTool:
             "Content-Type": "application/json"
         }
         self.ads_api = NaverSearchAdsAPI(self.config['naver_ads_api'])
-        self.coupang_crawler = get_shared_crawler()
         self.output_dir = self.config['settings']['output_dir']
         self.save_excel = bool(self.config.get("settings", {}).get("save_excel", False))
         self.db_enabled = bool(self.config.get("settings", {}).get("db_enabled", True))
@@ -199,6 +198,11 @@ class BlueOceanTool:
                 # DB 설정이 없어도 GUI 사용은 가능해야 하므로 저장 기능만 비활성화
                 self.db_enabled = False
                 print(f"[WARN] DB 연결 설정 누락/실패로 DB 저장을 비활성화합니다: {e}")
+
+    @property
+    def coupang_crawler(self):
+        """세션 캐시된 Tool이 예전 크롤러 인스턴스를 붙잡지 않도록 매번 공유 인스턴스를 반환한다."""
+        return get_shared_crawler()
 
     def _apply_db_env_from_config(self):
         """

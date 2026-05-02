@@ -22,6 +22,7 @@ if sys.platform == "win32":
         pass
 
 from blue_ocean_tool import BlueOceanTool, apply_database_env_from_config
+from coupang_crawler import get_shared_crawler
 from db import (
     get_connection,
     is_dsn_configured,
@@ -217,12 +218,14 @@ def _render_coupang_rank_table_live(keyword_text: str) -> None:
             pass
 
     tool_local = get_tool()
+    cc = get_shared_crawler()
     kw = str(keyword_text).strip()
     coupang_items: List[dict] = []
     from_memory = False
     from_json_file = False
     if kw:
-        coupang_items = tool_local.coupang_crawler.get_smoke_ranked_ui_cache(kw)
+        _cache_fn = getattr(cc, "get_smoke_ranked_ui_cache", None)
+        coupang_items = list(_cache_fn(kw)) if callable(_cache_fn) else []
         from_memory = bool(coupang_items)
         if not coupang_items and is_dsn_configured():
             try:
@@ -273,7 +276,7 @@ def _render_coupang_rank_table_live(keyword_text: str) -> None:
                 )
             else:
                 st.caption("표시: MariaDB에 저장된 해당 키워드 **가장 최근** 결과(최대 10위).")
-        elif tool_local.coupang_crawler.is_smoke_playwright_running():
+        elif getattr(cc, "is_smoke_playwright_running", lambda: False)():
             st.caption(
                 "스모크 실행 중입니다. 순위표는 probe 완료 후 수 초 안에 자동으로 채워집니다 "
                 f"(약 {_COUPANG_TABLE_REFRESH_SEC:.0f}초 간격 갱신)."
@@ -677,6 +680,11 @@ def run() -> None:
         st.caption(
             "**키워드 검색** 은 입력한 쿠팡 키워드로 Playwright Chromium 스모크를 실행합니다. "
             f"최대 {int(_PLAYWRIGHT_SMOKE_MAX_SECONDS)}초 유지하며, **[강제 종료]** 로 중단할 수 있습니다."
+        )
+        st.caption(
+            "이 화면은 **PNG 스크린샷을 저장하지 않습니다**(.smoke/smoke_step*.png 등은 Cursor·외부 스모크 도구 산물일 수 있음). "
+            "브라우저 **세션 스냅샷** 저장만 `.smoke/coupang_state.json` 에 하며, 끄려면 `COUPANG_SMOKE_STORAGE_STATE=false` "
+            "환경변수를 설정하세요."
         )
 
         c_input_col1, c_input_col2 = st.columns([3, 1])
