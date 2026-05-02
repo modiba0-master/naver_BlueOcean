@@ -380,7 +380,8 @@ def run() -> None:
                     width='stretch',
                     key="dl_analysis_report",
                 )
-                detail_df = tool.get_last_analysis_detail_df()
+                _detail_fn = getattr(tool, "get_last_analysis_detail_df", None)
+                detail_df = _detail_fn() if callable(_detail_fn) else pd.DataFrame()
                 if isinstance(detail_df, pd.DataFrame) and not detail_df.empty:
                     with st.expander("소싱 고도화 진단 (Stage 1~3)", expanded=False):
                         stage_cols = [
