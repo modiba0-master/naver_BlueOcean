@@ -191,6 +191,118 @@ def finish_run(run_id: int, *, success: bool, result_count: int = 0, error_messa
             )
 
 
+def _dash_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        if math.isnan(x):
+            return default
+        return x
+    except Exception:
+        return default
+
+
+def dashboard_classify_keyword_intent(keyword: str) -> str:
+    """키워드 텍스트만으로 검색 의도 분류(DB 미저장 분석과 동일 규칙)."""
+    try:
+        text = str(keyword or "").strip().lower()
+        if not text:
+            return "정보형"
+        if any(k in text for k in ("구매", "가격", "할인")):
+            return "구매형"
+        if any(k in text for k in ("추천", "비교", "순위")):
+            return "탐색형"
+        return "정보형"
+    except Exception:
+        return "정보형"
+
+
+def dashboard_detect_seasonality(trend_series: List[float]) -> str:
+    """월별 추정 검색량 시계열로 시즌 유형 추정(BlueOceanTool과 동일 기준)."""
+    try:
+        vals = [_dash_safe_float(v, 0.0) for v in trend_series if _dash_safe_float(v, 0.0) > 0]
+        if len(vals) < 6:
+            return "steady"
+        peak = max(vals)
+        avg = sum(vals) / len(vals)
+        trough = min(vals)
+        variance = sum((x - avg) ** 2 for x in vals) / len(vals)
+        std_v = math.sqrt(max(0.0, variance))
+        vol_ratio = (std_v / avg) if avg > 1e-12 else 0.0
+        recent = sum(vals[-3:]) / max(1, len(vals[-3:]))
+        prev = sum(vals[:-3]) / max(1, len(vals[:-3])) if len(vals) > 3 else avg
+        seasonal_pattern = avg > 0 and peak / avg >= 1.6 and trough / avg <= 0.7
+        volatile_enough = vol_ratio > 0.25
+        if seasonal_pattern and volatile_enough:
+            return "seasonal"
+        if prev > 0 and recent / prev >= 1.25:
+            return "trend"
+        return "steady"
+    except Exception:
+        return "steady"
+
+
+def dashboard_sales_power_estimate(
+    top10_rev: Optional[float],
+    top10_price: Optional[float],
+    monthly_click: float,
+    avg_ctr: float,
+) -> float:
+    """DB에 판매력이 없을 때 Top10·클릭 기반 0~100 추정."""
+    try:
+        mc = max(0.0, float(monthly_click))
+        ctr = max(0.0, float(avg_ctr))
+        review_price = 0.0
+        if top10_price is not None and float(top10_price) > 0 and top10_rev is not None:
+            lp_price = math.log1p(max(1.0, float(top10_price)))
+            denom_price = max(math.pow(lp_price, 0.7), 1e-12)
+            review_price = math.log1p(max(0.0, float(top10_rev))) / denom_price
+        conv_fb = max(0.1, math.log1p(mc) * (1.0 + ctr / 100.0))
+        rp_part = min(100.0, review_price * 42.0) if review_price > 0 else 0.0
+        fb_part = min(100.0, conv_fb * 35.0)
+        sp = rp_part + (fb_part * 0.35 if rp_part <= 0 else fb_part * 0.2)
+        return round(max(0.0, min(100.0, sp)), 2)
+    except Exception:
+        return 0.0
+
+
+def query_analysis_runs_history(limit: int = 80) -> List[Dict[str, Any]]:
+    """
+    실행로그 탭 「분석 실행」으로 적재된 analysis_runs 목록 (run 단위).
+    시장성 점수 탭에서 특정 실행 결과만 불러올 때 사용.
+    """
+    lim = max(1, min(int(limit), 200))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ar.id, ar.started_at, ar.finished_at, ar.status,
+                       ar.seed_keywords_raw, ar.result_count,
+                       (
+                           SELECT COUNT(*) FROM keyword_metrics km WHERE km.run_id = ar.id
+                       ) AS metric_rows
+                FROM analysis_runs ar
+                ORDER BY ar.started_at DESC
+                LIMIT %s
+                """,
+                (lim,),
+            )
+            rows = cur.fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "run_id": int(r[0]),
+                "started_at": r[1],
+                "finished_at": r[2],
+                "status": str(r[3] or ""),
+                "seed_keywords_raw": str(r[4] or ""),
+                "result_count": int(r[5] or 0),
+                "metric_rows": int(r[6] or 0),
+            }
+        )
+    return out
+
+
 def insert_keyword_metrics(
     run_id: int, rows: Iterable[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
@@ -632,24 +744,36 @@ def query_market_score_rows(
     keyword_like: Optional[str] = None,
     started_from: Optional[datetime] = None,
     started_to: Optional[datetime] = None,
+    run_id: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     대시보드용 시장성 점수 조회 행.
     점수식: 수요 * 트렌드 * 전환 / 경쟁
+
+    run_id 가 주어지면 해당 실행(run)에 속한 행만 반환하고, 기간 필터는 적용하지 않는다.
     """
     where_parts: List[str] = []
     params: List[Any] = []
     if keyword_like:
         where_parts.append("km.keyword_text LIKE %s")
         params.append(f"%{keyword_like.strip()}%")
-    if started_from:
-        where_parts.append("ar.started_at >= %s")
-        params.append(started_from)
-    if started_to:
-        where_parts.append("ar.started_at <= %s")
-        params.append(started_to)
+    if run_id is not None:
+        where_parts.append("ar.id = %s")
+        params.append(int(run_id))
+    else:
+        if started_from:
+            where_parts.append("ar.started_at >= %s")
+            params.append(started_from)
+        if started_to:
+            where_parts.append("ar.started_at <= %s")
+            params.append(started_to)
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-    lim = max(1, min(int(limit), 500))
+    if run_id is not None:
+        lim = max(1, min(int(limit), 15000))
+        order_sql = "ORDER BY km.seed_keyword ASC, km.blue_ocean_score DESC"
+    else:
+        lim = max(1, min(int(limit), 500))
+        order_sql = "ORDER BY km.monthly_search_volume_est DESC, ar.started_at DESC"
     params.append(lim)
 
     with get_connection() as conn:
@@ -660,7 +784,8 @@ def query_market_score_rows(
                        km.monthly_search_volume_est, km.monthly_click_est, km.avg_ctr_pct,
                        km.product_count, km.top10_avg_reviews, km.top10_avg_price, km.blue_ocean_score,
                        ke.opportunity_score, ke.commercial_score, ke.final_score, ke.decision_band,
-                       ai.summary_text, ai.action_text, ai.risk_text, ai.confidence_score, ai.model_version
+                       ai.summary_text, ai.action_text, ai.risk_text, ai.confidence_score, ai.model_version,
+                       ar.id
                 FROM keyword_metrics km
                 JOIN analysis_runs ar ON ar.id = km.run_id
                 LEFT JOIN keyword_evaluations ke ON ke.metric_id = km.id
@@ -674,7 +799,7 @@ def query_market_score_rows(
                     ) t2 ON t1.metric_id = t2.metric_id AND t1.id = t2.max_id
                 ) ai ON ai.metric_id = km.id
                 {where_sql}
-                ORDER BY km.monthly_search_volume_est DESC, ar.started_at DESC
+                {order_sql}
                 LIMIT %s
                 """,
                 tuple(params),
@@ -739,6 +864,17 @@ def query_market_score_rows(
         ai_risk = str(r[17]) if r[17] is not None else None
         ai_confidence = float(r[18]) if r[18] is not None else None
         ai_model_version = str(r[19]) if r[19] is not None else None
+        analysis_run_id = int(r[20]) if len(r) > 20 and r[20] is not None else None
+
+        kw_txt = str(r[3] or "")
+        intent_d = dashboard_classify_keyword_intent(kw_txt)
+        season_d = dashboard_detect_seasonality(trend_vols)
+        if commercial_score is not None:
+            sales_pw = round(max(0.0, min(100.0, float(commercial_score))), 2)
+        else:
+            sales_pw = dashboard_sales_power_estimate(
+                top10_avg_reviews, top10_avg_price, monthly_click, avg_ctr
+            )
 
         out.append(
             {
@@ -766,10 +902,15 @@ def query_market_score_rows(
                 "ai_risk": ai_risk,
                 "ai_confidence": ai_confidence,
                 "ai_model_version": ai_model_version,
+                "analysis_run_id": analysis_run_id,
+                "intent": intent_d,
+                "season_type": season_d,
+                "sales_power": sales_pw,
             }
         )
 
-    out.sort(key=lambda x: x["market_score"], reverse=True)
+    if run_id is None:
+        out.sort(key=lambda x: x["market_score"], reverse=True)
     return out
 
 
@@ -914,6 +1055,120 @@ def query_coupang_latest_ranked_items(keyword_text: str, limit: int = 10) -> Lis
                 "review_count": row[4] or "",
                 "review_score": row[5] or "",
                 "url": row[6] or "",
+            }
+        )
+    return out
+
+
+def create_insight_discovery_run(
+    seed_keyword: str,
+    shopping_category_path: Optional[str],
+    datalab_category_id: Optional[int],
+    period_start: date,
+    period_end: date,
+    *,
+    status: str = "SUCCESS",
+    note: str = "",
+) -> Dict[str, Any]:
+    """인사이트 파이프라인 실행 1건 메타 저장."""
+    run_token = uuid.uuid4().hex[:24]
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO insight_discovery_runs
+                (run_token, seed_keyword, shopping_category_path, datalab_category_id,
+                 datalab_period_start, datalab_period_end, status, note)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    run_token,
+                    str(seed_keyword)[:255],
+                    shopping_category_path,
+                    int(datalab_category_id) if datalab_category_id is not None else None,
+                    period_start,
+                    period_end,
+                    str(status)[:20],
+                    (note[:65000] if note else None),
+                ),
+            )
+            run_id = int(cur.lastrowid)
+    return {"id": run_id, "run_token": run_token}
+
+
+def insert_insight_discovery_keywords(run_id: int, rows: Iterable[Dict[str, Any]]) -> int:
+    batch: List[tuple] = []
+    for r in rows:
+        batch.append(
+            (
+                int(run_id),
+                str(r.get("row_kind", "INSIGHT"))[:16],
+                int(r["insight_rank"]) if r.get("insight_rank") is not None else None,
+                str(r.get("keyword_text", ""))[:255],
+                int(r.get("mobile_monthly_qc", 0) or 0),
+                float(r.get("mobile_monthly_clk", 0.0) or 0.0),
+                float(r.get("ctr_pct", 0.0) or 0.0),
+                int(r.get("product_count", 0) or 0),
+                float(r.get("market_fit_score", 0.0) or 0.0),
+                float(r["vs_seed_volume_ratio"]) if r.get("vs_seed_volume_ratio") is not None else None,
+                float(r["vs_seed_click_ratio"]) if r.get("vs_seed_click_ratio") is not None else None,
+            )
+        )
+    if not batch:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO insight_discovery_keywords
+                (run_id, row_kind, insight_rank, keyword_text, mobile_monthly_qc, mobile_monthly_clk,
+                 ctr_pct, product_count, market_fit_score, vs_seed_volume_ratio, vs_seed_click_ratio)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                batch,
+            )
+    return len(batch)
+
+
+def query_insight_discovery_rows(limit: int = 100) -> List[Dict[str, Any]]:
+    """대시보드용: 최근 인사이트 파이프라인 키워드 행."""
+    lim = max(1, min(int(limit), 500))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.created_at, r.seed_keyword, r.shopping_category_path, r.datalab_category_id,
+                       k.row_kind, k.insight_rank, k.keyword_text,
+                       k.mobile_monthly_qc, k.mobile_monthly_clk, k.ctr_pct, k.product_count,
+                       k.market_fit_score, k.vs_seed_volume_ratio, k.vs_seed_click_ratio
+                FROM insight_discovery_runs r
+                INNER JOIN insight_discovery_keywords k ON k.run_id = r.id
+                ORDER BY r.created_at DESC,
+                         CASE k.row_kind WHEN 'SEED' THEN 0 ELSE 1 END,
+                         COALESCE(k.insight_rank, 9999) ASC
+                LIMIT %s
+                """,
+                (lim,),
+            )
+            raw = cur.fetchall()
+    out: List[Dict[str, Any]] = []
+    for row in raw:
+        out.append(
+            {
+                "created_at": row[0],
+                "seed_keyword": row[1],
+                "shopping_category_path": row[2],
+                "datalab_category_id": row[3],
+                "row_kind": row[4],
+                "insight_rank": row[5],
+                "keyword_text": row[6],
+                "mobile_monthly_qc": int(row[7] or 0),
+                "mobile_monthly_clk": float(row[8] or 0),
+                "ctr_pct": float(row[9] or 0),
+                "product_count": int(row[10] or 0),
+                "market_fit_score": float(row[11] or 0),
+                "vs_seed_volume_ratio": float(row[12]) if row[12] is not None else None,
+                "vs_seed_click_ratio": float(row[13]) if row[13] is not None else None,
             }
         )
     return out
