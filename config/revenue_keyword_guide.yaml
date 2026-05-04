@@ -1,0 +1,24 @@
+# 추천 엔진 운영 설정 (UI > ENV > YAML > 코드 기본값)
+# ENV: TOP_N, SEM, MIN_SEARCH, MIN_CTR
+
+filter:
+  min_search: 500
+  min_ctr: 1.0
+
+step4:
+  top_n: 100
+  semaphore: 4
+
+score:
+  demand: 0.25
+  competition: 0.25
+  ctr: 0.25
+  trend: 0.25
+
+# 추천 엔진 전용(대시보드 UI가 우선). 쿠팡 전 후보·스냅샷 동작 참고용.
+# precoupang:
+#   save_db: true
+#   save_csv: false
+#   max_rows: 2000
+#   persist_coupang_snapshot: true
+# skip_coupang: false

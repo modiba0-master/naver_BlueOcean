@@ -13,6 +13,7 @@
         "min_search_volume": 1000,
         "max_item_count": 500000,
         "db_enabled": true,
-        "save_excel": false
+        "save_excel": false,
+        "skip_coupang_top10_in_analysis": true
     }
 }

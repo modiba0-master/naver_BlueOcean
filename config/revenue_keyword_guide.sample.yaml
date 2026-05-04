@@ -1,0 +1,135 @@
+# 매출 키워드 추천 파이프라인 — 샘플 가이드 (복사 후 수정)
+# 실사용 시 예: revenue_keyword_guide.yaml 로 복사하고 경로를 환경변수 또는 UI에서 지정
+
+version: 1
+
+meta:
+  name: 초기_판매자_매출키워드
+  description: >
+    초기 판매자용 후보 생성 → 필터 → 스코어링 → 쿠팡 검증 → 최종 추천
+
+# --- 대상 범위 ---
+target_audience:
+  seller_profile: 초기_소량_셀러
+  focus: 일반_셀러_소싱_가능_상품
+
+categories_allowlist:
+  - 생활
+  - 인테리어
+  - 반려동물
+  - 자동차
+  - 뷰티
+
+# 브랜드·금지 패턴 (정규식 또는 부분 문자열 — 구현 시 규칙 엔진과 연결)
+brand_and_noise:
+  exclude_brand_like: true
+  brand_name_patterns:
+    - "\\b[A-Z]{2,}\\d+\\b"
+    - "(나이키|아디다스|삼성|LG|애플)"
+  exclude_fragments:
+    - "공식몰"
+    - "정품인증"
+
+# ========== STEP 1 — 후보 대량 생성 ==========
+step1_candidate_generation:
+  goal: 초기_판매자_키워드_후보_풀
+  seed_keywords:
+    target_count_min: 300
+    target_count_max: 500
+    sources:
+      - datalab_popular
+      - category_insight
+      - manual_seeds
+  expansion:
+    naver_related_keyword_api: true
+    max_depth_or_rounds: 3
+  intent_tokens:
+    - 추천
+    - 가성비
+    - 고급
+    - 순위
+    - 비교
+  attribute_tokens:
+    - 무선
+    - 미니
+    - 대용량
+    - 접이식
+    - 휴대용
+  combination:
+    cartesian_intent_attr_with_seed: true
+    max_combinations_per_seed: 40
+  output:
+    target_min_total_keywords: 10000
+    dedup_casefold: true
+    normalize_whitespace: true
+
+# ========== STEP 2 — 1차 필터링 ==========
+step2_hard_filter:
+  goal: 셀러_접근_가능_키워드만
+  rules:
+    min_monthly_search_volume: 500
+    max_product_count: 50000
+    min_ctr_pct: 1.0
+  expected_remaining_band: "2000~3000"
+
+# ========== STEP 3 — 스코어링 (keyword_score) ==========
+step3_keyword_scoring:
+  goal: 매출_가능성_점수
+  components:
+    demand:
+      description: 검색량_기반
+      weight: 0.30
+    competition:
+      description: 상품수_역수_또는_경쟁도
+      weight: 0.30
+    conversion:
+      description: CTR
+      weight: 0.20
+    trend:
+      description: 검색량_상승률
+      weight: 0.20
+  output_field: keyword_score
+
+# ========== STEP 4 — 상품 검증 (쿠팡 Top10) ==========
+step4_product_validation:
+  goal: 실제_판매_가능_키워드만
+  enabled: true
+  coupang:
+    top_n: 10
+  metrics_to_collect:
+    - avg_reviews_top10
+    - price_quantiles
+    - review_distribution
+    - price_distribution
+  sales_power:
+    field: sales_power
+    rules:
+      require_any_product_reviews_gte: 100
+      min_typical_price_band:
+        note: 마진_가능_최소_가격대_임계_TBD
+
+# ========== STEP 5 — 최종 추천 ==========
+step5_final_recommendation:
+  goal: TOP_20_to_50
+  formula:
+    final_score: "(keyword_score * 0.5) + (sales_power * 0.5)"
+    keyword_score_weight: 0.5
+    sales_power_weight: 0.5
+  output:
+    top_n_min: 20
+    top_n_max: 50
+    fields:
+      - keyword
+      - total_or_final_score
+      - sales_power
+      - competition
+      - reason_one_liner
+
+# 기존 엔진과의 매핑 메모 (구현 시 코드에서 참조)
+engine_mapping_notes:
+  blue_ocean_tool:
+    demand_score: step3.components.demand
+    competition_score: step3.components.competition
+    conversion_score: step3.components.conversion
+    trend_score: step3.components.trend
+  normalization: scores_0_100_then_blend

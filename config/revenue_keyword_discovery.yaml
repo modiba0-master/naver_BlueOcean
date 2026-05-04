@@ -1,0 +1,119 @@
+# 키워드 발굴: 1차 카테고리(버티컬) + 2차 매출 규모 프리셋
+# 네이버 쇼핑 API category1~4 경로와 매칭합니다. (category_naver.xls L1과 대응)
+# 스코어 가중·final_score 공식은 revenue_keyword_guide.yaml 쪽을 따릅니다.
+
+tier_presets:
+  small_10m:
+    label: "소규모 · 월 약 1,000만 원"
+    target_monthly_revenue_krw: 10000000
+    filter:
+      min_search: 350
+      min_ctr: 1.05
+      max_search: 15000
+    pool:
+      max_products: 32000
+    coupang:
+      topk_validate: 3
+      min_review_topk: 55
+      min_avg_price_topk: 11000
+
+  medium_30m:
+    label: "중규모 · 월 약 3,000만 원"
+    target_monthly_revenue_krw: 30000000
+    filter:
+      min_search: 600
+      min_ctr: 1.0
+    pool:
+      max_products: 50000
+    coupang:
+      topk_validate: 3
+      min_review_topk: 100
+      min_avg_price_topk: 8000
+
+  large_50m:
+    label: "대규모 · 월 약 5,000만 원"
+    target_monthly_revenue_krw: 50000000
+    filter:
+      min_search: 1500
+      min_ctr: 0.88
+    pool:
+      max_products: 80000
+    coupang:
+      topk_validate: 3
+      min_review_topk: 160
+      min_avg_price_topk: 7000
+
+verticals:
+  패션잡화:
+    seed_hints: ["패션잡화", "패션소품"]
+    match:
+      l1_any: ["패션잡화", "패션의류"]
+
+  미용:
+    seed_hints: ["스킨케어", "헤어케어"]
+    match:
+      l1_any: ["화장품/미용"]
+
+  인테리어:
+    seed_hints: ["인테리어소품", "홈데코"]
+    match:
+      l1_any: ["가구/인테리어"]
+
+  생활용품:
+    seed_hints: ["생활용품", "리빙"]
+    match:
+      l1_any: ["생활/건강"]
+      path_contains_any:
+        - "수납"
+        - "정리"
+        - "청소"
+        - "세탁"
+        - "리빙"
+        - "생활용품"
+        - "테이프"
+        - "빨래"
+        - "다리미"
+
+  반려동물 용품:
+    seed_hints: ["강아지", "고양이", "펫"]
+    match:
+      l1_any: ["생활/건강"]
+      path_contains_any:
+        - "반려"
+        - "펫"
+        - "애견"
+        - "강아지"
+        - "고양이"
+        - "사료"
+        - "모래"
+        - "캣"
+        - "펫푸드"
+
+  주방용품:
+    seed_hints: ["주방용품", "주방잡화"]
+    match:
+      l1_any: ["생활/건강"]
+      path_contains_any:
+        - "주방"
+        - "식기"
+        - "도마"
+        - "냄비"
+        - "프라이팬"
+        - "조리"
+        - "밀폐"
+        - "보온"
+        - "컵"
+        - "텀블러"
+
+  욕실용품:
+    seed_hints: ["욕실용품", "욕실수납"]
+    match:
+      l1_any: ["생활/건강"]
+      path_contains_any:
+        - "욕실"
+        - "비누"
+        - "샤워"
+        - "욕조"
+        - "칫솔"
+        - "화장실"
+        - "수건"

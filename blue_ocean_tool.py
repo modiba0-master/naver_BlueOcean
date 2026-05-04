@@ -243,6 +243,12 @@ class BlueOceanTool:
                 raise RuntimeError("DB 모듈(db.py) 로드 실패: MariaDB 저장을 사용할 수 없습니다.")
             try:
                 ensure_schema()
+                try:
+                    from db import log_recommended_keywords_schema_status
+
+                    log_recommended_keywords_schema_status()
+                except Exception as e2:
+                    print(f"[WARN] recommended_keywords schema log: {e2}")
             except Exception as e:
                 # DB 설정이 없어도 GUI 사용은 가능해야 하므로 저장 기능만 비활성화
                 self.db_enabled = False
@@ -1548,6 +1554,13 @@ class BlueOceanTool:
         log("\n❌ 분석 결과가 없습니다. 주제어와 날짜 설정을 확인해주세요.")
         self._last_analysis_detail_df = pd.DataFrame()
         return None, None
+
+    def run_recommended_keyword_engine(self, seeds_csv: str, **kwargs: Any) -> Dict[str, Any]:
+        """추천 키워드 파이프라인(연관 확장·모바일 필터·스코어·쿠팡·DB)."""
+        from recommended_keyword_engine import RecommendedKeywordEngine
+
+        eng = RecommendedKeywordEngine(self)
+        return eng.run(seeds_csv, **kwargs)
 
 
 class BlueOceanToolGUI:

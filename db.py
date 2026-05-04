@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import pymysql
 
@@ -160,6 +160,35 @@ def ensure_schema() -> None:
         with conn.cursor() as cur:
             for stmt in statements:
                 cur.execute(stmt)
+
+
+def log_recommended_keywords_schema_status() -> None:
+    """recommended_keywords 테이블 존재 시 스키마 적용 로그."""
+    if not is_dsn_configured():
+        return
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM information_schema.tables
+                    WHERE table_schema = DATABASE() AND table_name = 'recommended_keywords'
+                    """
+                )
+                row = cur.fetchone()
+                if row and int(row[0] or 0) > 0:
+                    print("[Schema] recommended_keywords ensured", flush=True)
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM information_schema.tables
+                    WHERE table_schema = DATABASE() AND table_name = 'recommended_keyword_candidates'
+                    """
+                )
+                row2 = cur.fetchone()
+                if row2 and int(row2[0] or 0) > 0:
+                    print("[Schema] recommended_keyword_candidates ensured", flush=True)
+    except Exception as e:
+        print(f"[Schema] recommended_keywords check skipped: {e}", flush=True)
 
 
 def create_run(seed_keywords_raw: str, start_date: date, end_date: date) -> Dict[str, Any]:
@@ -1172,3 +1201,169 @@ def query_insight_discovery_rows(limit: int = 100) -> List[Dict[str, Any]]:
             }
         )
     return out
+
+
+def insert_recommended_keywords(
+    batch_token: str,
+    seed_keywords_raw: str,
+    rows: Iterable[Dict[str, Any]],
+) -> int:
+    """
+    추천 엔진 결과 행 삽입.
+    각 row: rank_position, keyword_text, keyword(선택·없으면 keyword_text), metric_basis,
+    monthly_search_volume, product_count, ctr_pct, demand_score, competition_component,
+    ctr_component, trend_score, keyword_score, sales_power, final_score,
+    intent, season_type, reason_text, extra_json(optional dict)
+    """
+    n = 0
+    rows_list = list(rows)
+    if not rows_list:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for r in rows_list:
+                extra = r.get("extra_json")
+                ex_val = None
+                if extra is not None:
+                    ex_val = json.dumps(extra, ensure_ascii=False)
+                kw_disp = str(r.get("keyword") or r.get("keyword_text") or "")[:255]
+                cur.execute(
+                    """
+                    INSERT INTO recommended_keywords
+                    (batch_token, seed_keywords_raw, rank_position, keyword_text, keyword, metric_basis,
+                     monthly_search_volume, product_count, ctr_pct,
+                     demand_score, competition_component, ctr_component, trend_score,
+                     keyword_score, sales_power, final_score, intent, season_type,
+                     reason_text, extra_json)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        batch_token,
+                        seed_keywords_raw,
+                        int(r["rank_position"]),
+                        str(r["keyword_text"])[:255],
+                        kw_disp,
+                        str(r.get("metric_basis") or "mobile")[:16],
+                        int(r.get("monthly_search_volume") or 0),
+                        int(r.get("product_count") or 0),
+                        float(r.get("ctr_pct") or 0.0),
+                        float(r.get("demand_score") or 0.0),
+                        float(r.get("competition_component") or 0.0),
+                        float(r.get("ctr_component") or 0.0),
+                        float(r.get("trend_score") or 0.0),
+                        float(r.get("keyword_score") or 0.0),
+                        float(r.get("sales_power") or 0.0),
+                        float(r.get("final_score") or 0.0),
+                        (str(r.get("intent") or "")[:32] or None),
+                        (str(r.get("season_type") or "")[:32] or None),
+                        (str(r.get("reason_text") or "")[:768] or None),
+                        ex_val,
+                    ),
+                )
+                n += 1
+    return n
+
+
+def build_recommend_engine_coupang_snapshot_payload(
+    keyword: str,
+    crawl_data: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    추천 엔진의 crawl_coupang() 결과를 insert_coupang_search_snapshot 입력 형식으로 변환한다.
+    3번 탭 스모크와 동일 테이블(coupang_search_runs / coupang_search_ranked_items)에 적재한다.
+    """
+    kw = str(keyword or "").strip()[:255]
+    if not kw:
+        return None
+    if not isinstance(crawl_data, dict):
+        return None
+    items = list(crawl_data.get("top10_items") or [])[:10]
+    top10: List[Dict[str, Any]] = []
+    for idx, it in enumerate(items, start=1):
+        if not isinstance(it, dict):
+            continue
+        rv = it.get("review_count")
+        rs = it.get("review_score")
+        pr = it.get("price")
+        rc_str = ""
+        if rv is not None and str(rv).strip() != "":
+            try:
+                rc_str = str(int(float(rv)))
+            except (TypeError, ValueError):
+                rc_str = str(rv).strip()[:64]
+        top10.append(
+            {
+                "rank": idx,
+                "title": str(it.get("title") or "")[:1000],
+                "price": "" if pr is None else str(pr),
+                "shipping": str(it.get("shipping_fee") or it.get("shipping") or "")[:255],
+                "review_count": rc_str,
+                "review_score": "" if rs is None else str(rs),
+                "url": str(it.get("url") or "")[:1200],
+            }
+        )
+    qurl = f"https://www.coupang.com/np/search?component=&q={quote(kw)}&channel=user"
+    return {
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "keyword": kw,
+        "source_type": "recommend_engine",
+        "url": qurl,
+        "title": str(crawl_data.get("page_title") or "")[:500] or None,
+        "html_len": crawl_data.get("html_len"),
+        "card_count": int(crawl_data.get("product_count") or len(items) or 0) or None,
+        "organic_count": len(items) or None,
+        "top10": top10,
+        "reason_code": str(crawl_data.get("reason_code") or ""),
+    }
+
+
+def insert_recommended_keyword_candidates(
+    batch_token: str,
+    seed_keywords_raw: str,
+    rows: Iterable[Dict[str, Any]],
+) -> int:
+    """쿠팡·final_score 이전 단계의 스코어만 저장."""
+    n = 0
+    rows_list = list(rows)
+    if not rows_list:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for r in rows_list:
+                extra = r.get("extra_json")
+                ex_val = None
+                if extra is not None:
+                    ex_val = json.dumps(extra, ensure_ascii=False)
+                kw_disp = str(r.get("keyword") or r.get("keyword_text") or "")[:255]
+                cur.execute(
+                    """
+                    INSERT INTO recommended_keyword_candidates
+                    (batch_token, seed_keywords_raw, rank_position, keyword_text, keyword, metric_basis,
+                     monthly_search_volume, product_count, ctr_pct,
+                     demand_score, competition_component, ctr_component, trend_score,
+                     keyword_score, intent, season_type, reason_text, extra_json)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        batch_token,
+                        seed_keywords_raw,
+                        int(r["rank_position"]),
+                        str(r["keyword_text"])[:255],
+                        kw_disp,
+                        str(r.get("metric_basis") or "mobile")[:16],
+                        int(r.get("monthly_search_volume") or 0),
+                        int(r.get("product_count") or 0),
+                        float(r.get("ctr_pct") or 0.0),
+                        float(r.get("demand_score") or 0.0),
+                        float(r.get("competition_component") or 0.0),
+                        float(r.get("ctr_component") or 0.0),
+                        float(r.get("trend_score") or 0.0),
+                        float(r.get("keyword_score") or 0.0),
+                        (str(r.get("intent") or "")[:32] or None),
+                        (str(r.get("season_type") or "")[:32] or None),
+                        (str(r.get("reason_text") or "")[:768] or None),
+                        ex_val,
+                    ),
+                )
+                n += 1
+    return n

@@ -14,3 +14,7 @@
 
 # 로컬만 Railway MariaDB 공개 URL 등 (커밋 금지)
 config.local.json
+
+# Chroma 로컬 DB / 추천 엔진 precoup CSV 산출물
+.chroma/
+reports/recommended_precoup_*.csv
