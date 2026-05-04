@@ -17,7 +17,7 @@ from coupang_ranked_data import (
     default_smoke_extract_json_path,
     resolve_coupang_ranked_snapshot,
 )
-from db import is_dsn_configured, query_coupang_latest_ranked_items
+from db import get_connection, is_dsn_configured, query_coupang_latest_ranked_items
 
 _COUPANG_TABLE_REFRESH_SEC = 2.0
 _PLAYWRIGHT_SMOKE_MAX_SECONDS = 5.0
@@ -27,6 +27,181 @@ _LAST_SMOKE_JSON_PATH = default_smoke_extract_json_path()
 
 _SESSION_COUPANG_PREP_STATUS = "coupang_prep_status"
 _SESSION_LAST_SMOKE_EXTRACT_MTIME = "_last_smoke_extract_mtime"
+
+
+def _load_recent_recommended_keywords(limit: int = 200) -> list[str]:
+    """
+    최근 추천엔진 후보(recommended_keyword_candidates)에서 키워드를 가져온다.
+    - 배치 내 rank_position 순서 우선
+    - 중복 제거 후 최신 배치부터 노출
+    """
+    if not is_dsn_configured():
+        return []
+    try:
+        lim = max(20, min(int(limit), 1000))
+    except Exception:
+        lim = 200
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT c.keyword_text
+                    FROM recommended_keyword_candidates c
+                    INNER JOIN (
+                        SELECT batch_token, MAX(created_at) AS max_created
+                        FROM recommended_keyword_candidates
+                        GROUP BY batch_token
+                        ORDER BY max_created DESC
+                        LIMIT 20
+                    ) b ON c.batch_token = b.batch_token
+                    ORDER BY b.max_created DESC, c.rank_position ASC
+                    LIMIT %s
+                    """,
+                    (lim,),
+                )
+                rows = cur.fetchall()
+    except Exception:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for r in rows:
+        kw = str((r[0] if isinstance(r, (list, tuple)) else r) or "").strip()
+        if not kw:
+            continue
+        if kw in seen:
+            continue
+        seen.add(kw)
+        out.append(kw)
+    return out
+
+
+def _load_recent_candidate_batches(limit: int = 20) -> list[dict]:
+    """recommended_keyword_candidates 최근 배치 목록(batch_token, created_at, count)."""
+    if not is_dsn_configured():
+        return []
+    try:
+        lim = max(5, min(int(limit), 100))
+    except Exception:
+        lim = 20
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT batch_token, MAX(created_at) AS max_created, COUNT(*) AS row_count
+                    FROM recommended_keyword_candidates
+                    GROUP BY batch_token
+                    ORDER BY max_created DESC
+                    LIMIT %s
+                    """,
+                    (lim,),
+                )
+                rows = cur.fetchall()
+    except Exception:
+        return []
+    out: list[dict] = []
+    for row in rows:
+        out.append(
+            {
+                "batch_token": str(row[0] or ""),
+                "created_at": row[1],
+                "row_count": int(row[2] or 0),
+            }
+        )
+    return out
+
+
+def _load_keywords_by_candidate_batch(batch_token: str, limit: int = 500) -> list[str]:
+    """특정 recommended_keyword_candidates 배치에서 rank 순 키워드 목록."""
+    bt = str(batch_token or "").strip()
+    if not bt or not is_dsn_configured():
+        return []
+    try:
+        lim = max(20, min(int(limit), 3000))
+    except Exception:
+        lim = 500
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT keyword_text
+                    FROM recommended_keyword_candidates
+                    WHERE batch_token = %s
+                    ORDER BY rank_position ASC
+                    LIMIT %s
+                    """,
+                    (bt, lim),
+                )
+                rows = cur.fetchall()
+    except Exception:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in rows:
+        kw = str((r[0] if isinstance(r, (list, tuple)) else r) or "").strip()
+        if not kw or kw in seen:
+            continue
+        seen.add(kw)
+        out.append(kw)
+    return out
+
+
+def _load_recent_coupang_saved_keywords(limit: int = 300) -> list[str]:
+    """coupang_search_runs에 저장된 최근 키워드 목록(source_type 무관)."""
+    if not is_dsn_configured():
+        return []
+    try:
+        lim = max(20, min(int(limit), 2000))
+    except Exception:
+        lim = 300
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT keyword_text
+                    FROM coupang_search_runs
+                    GROUP BY keyword_text
+                    ORDER BY MAX(collected_at) DESC
+                    LIMIT %s
+                    """,
+                    (lim,),
+                )
+                rows = cur.fetchall()
+    except Exception:
+        return []
+    out: list[str] = []
+    for r in rows:
+        kw = str((r[0] if isinstance(r, (list, tuple)) else r) or "").strip()
+        if kw:
+            out.append(kw)
+    return out
+
+
+def _render_coupang_rank_table_db_once(keyword_text: str) -> None:
+    """
+    선택 키워드 Top10을 DB에서 1회 조회해 표시한다.
+    (fragment auto-refresh 비활성: 선택 시 계속 재조회되는 현상 방지)
+    """
+    kw = str(keyword_text or "").strip()
+    if not kw:
+        st.info("키워드를 선택해주세요.")
+        return
+    if not is_dsn_configured():
+        st.warning("MariaDB가 설정되지 않아 저장된 Top10을 조회할 수 없습니다.")
+        return
+    try:
+        items = query_coupang_latest_ranked_items(kw, limit=10)
+    except Exception as e:
+        st.warning(f"쿠팡 DB 조회 실패: {e}")
+        return
+    if not items:
+        st.info("선택 키워드의 저장된 Top10이 없습니다.")
+        return
+    st.dataframe(build_top10_rank_dataframe(items), width="stretch", hide_index=True)
+    st.caption("표시: MariaDB에 저장된 해당 키워드 최신 Top10")
 
 
 def _rerun_if_smoke_json_updated() -> None:
@@ -109,6 +284,16 @@ def render_coupang_keyword_analysis_tab() -> None:
     """대시보드 탭 «쿠팡 상품 키워드 분석» 본문."""
     st.subheader("쿠팡 상품 키워드 분석")
     st.caption("단일 키워드 검색 결과 Top10 상품 정보를 표시합니다.")
+
+    with st.expander("이 탭과 4번 탭·DB 연동 (현재 방식)", expanded=False):
+        st.markdown(
+            "- **스모크 검색**: 아래 키워드 입력 후 실행 → Top10은 MariaDB "
+            "`coupang_search_runs` / `coupang_search_ranked_items` 에 저장됩니다.  \n"
+            "- **4번 매출 키워드 추천**의 **자동 쿠팡 수집**도 **동일 스모크 경로**를 키워드마다 순차 호출합니다.  \n"
+            "- 추천 엔진이 쿠팡 스냅샷을 켠 채 돌 때도 **같은 테이블**에 적재되며, 그때 `source_type`은 **`recommend_engine`** 입니다.  \n"
+            "- **단계별·저장 위치 전체**는 **4번 탭** 상단 **「현재까지 운영 방식」** 을 펼쳐 보세요.  \n"
+            "- 이 페이지 하단 **「추천엔진 추출 키워드 조회」**에서 배치 토큰별로 저장된 Top10을 골라 볼 수 있습니다."
+        )
 
     if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_NAME"):
         st.info(
@@ -216,3 +401,90 @@ def render_coupang_keyword_analysis_tab() -> None:
 
     _render_coupang_rank_table_live(coupang_keyword)
     st.caption("표시 컬럼: 순위, 상품명, 가격, 리뷰수, 평점, 배송비, 상품 URL")
+
+    st.markdown("---")
+    st.subheader("추천엔진 추출 키워드 조회")
+    st.caption(
+        "추천엔진에서 저장된 `recommended_keyword_candidates` 키워드를 필터링해서 선택하고, "
+        "선택 키워드의 쿠팡 Top10(최신 저장)을 확인합니다."
+    )
+
+    batches = _load_recent_candidate_batches(limit=30)
+    if not batches:
+        st.info("표시할 추천엔진 배치가 없습니다. (DB/스키마/저장 상태 확인)")
+        return
+
+    batch_options = [b["batch_token"] for b in batches if b.get("batch_token")]
+    batch_labels = {
+        b["batch_token"]: (
+            f"{b['batch_token']} · rows={b['row_count']} · "
+            f"created={b['created_at']}"
+        )
+        for b in batches
+        if b.get("batch_token")
+    }
+    selected_batch = st.selectbox(
+        "최근 배치 토큰 선택",
+        options=batch_options,
+        index=0,
+        key="coupang_reco_batch_token",
+        format_func=lambda x: batch_labels.get(x, x),
+    )
+    st.caption(
+        f"선택 배치: `{selected_batch}` · "
+        f"candidate rows={next((b['row_count'] for b in batches if b['batch_token']==selected_batch), 0)}"
+    )
+
+    source_mode = st.radio(
+        "키워드 목록 소스",
+        options=("선택 배치 후보", "쿠팡 저장 키워드", "후보+저장 합집합"),
+        index=2,
+        horizontal=True,
+        key="coupang_reco_kw_source_mode",
+    )
+
+    batch_kws = _load_keywords_by_candidate_batch(selected_batch, limit=800)
+    saved_kws = _load_recent_coupang_saved_keywords(limit=800)
+    if source_mode == "선택 배치 후보":
+        recent_kws = batch_kws
+    elif source_mode == "쿠팡 저장 키워드":
+        recent_kws = saved_kws
+    else:
+        recent_kws = []
+        seen_union: set[str] = set()
+        for kw in (batch_kws + saved_kws):
+            if kw in seen_union:
+                continue
+            seen_union.add(kw)
+            recent_kws.append(kw)
+
+    if not recent_kws:
+        # 폴백
+        recent_kws = _load_recent_recommended_keywords(limit=300)
+    if not recent_kws:
+        st.info("표시할 추천엔진 키워드가 없습니다. (DB/스키마/저장 상태 확인)")
+        return
+
+    f_col1, f_col2 = st.columns([2, 3])
+    with f_col1:
+        q = st.text_input(
+            "키워드 필터",
+            value="",
+            key="coupang_reco_kw_filter",
+            placeholder="예: 이케아, 타일, 텀블러",
+        )
+    qn = str(q).strip().lower()
+    filtered_kws = [kw for kw in recent_kws if (not qn or qn in kw.lower())]
+    if not filtered_kws:
+        st.warning("필터 결과가 없습니다.")
+        return
+
+    with f_col2:
+        selected_kw = st.selectbox(
+            "추출 완료 키워드 선택",
+            options=filtered_kws,
+            key="coupang_reco_kw_selected",
+        )
+
+    st.caption(f"필터 결과 {len(filtered_kws)}개 / 전체 {len(recent_kws)}개")
+    _render_coupang_rank_table_db_once(selected_kw)

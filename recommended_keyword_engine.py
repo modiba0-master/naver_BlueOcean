@@ -64,6 +64,18 @@ def _trend_norm_from_growth_factor(gf: float) -> float:
     return max(0.0, min(100.0, (gf - 0.7) / 1.1 * 100.0))
 
 
+def _split_category_path(cat_path: str) -> Tuple[str, str, str, str, str]:
+    cp = str(cat_path or "").strip()
+    if not cp:
+        return "", "", "", "", ""
+    parts = [p.strip() for p in cp.split(">") if p and p.strip()]
+    l1 = parts[0] if len(parts) > 0 else ""
+    l2 = parts[1] if len(parts) > 1 else ""
+    l3 = parts[2] if len(parts) > 2 else ""
+    l4 = parts[3] if len(parts) > 3 else ""
+    return cp, l1, l2, l3, l4
+
+
 def _expand_related_pool(tool: Any, seeds: List[str], target: int = 10_000) -> List[Dict[str, Any]]:
     pool: Dict[str, Dict[str, Any]] = {}
     q: deque[str] = deque()
@@ -422,6 +434,12 @@ class RecommendedKeywordEngine:
                 if match_spec is not None and not category_matches_vertical(cat_path, match_spec):
                     continue
                 r["product_count"] = int(pc)
+                cp, c1, c2, c3, c4 = _split_category_path(cat_path)
+                r["category_path"] = cp
+                r["category_l1"] = c1
+                r["category_l2"] = c2
+                r["category_l3"] = c3
+                r["category_l4"] = c4
                 filtered.append(r)
 
         log(f"[Recommend] {len(filtered)} filtered")
@@ -455,6 +473,11 @@ class RecommendedKeywordEngine:
                         "metric_basis": "mobile",
                         "monthly_search_volume": int(mo_qc),
                         "product_count": pc,
+                        "category_path": str(r.get("category_path") or ""),
+                        "category_l1": str(r.get("category_l1") or ""),
+                        "category_l2": str(r.get("category_l2") or ""),
+                        "category_l3": str(r.get("category_l3") or ""),
+                        "category_l4": str(r.get("category_l4") or ""),
                         "ctr_pct": round(ctr, 4),
                         "demand_score": round(d_norm, 2),
                         "competition_component": round(c_norm, 2),
@@ -484,6 +507,11 @@ class RecommendedKeywordEngine:
                     "metric_basis": row.get("metric_basis") or "mobile",
                     "monthly_search_volume": int(row.get("monthly_search_volume") or 0),
                     "product_count": int(row.get("product_count") or 0),
+                    "category_path": str(row.get("category_path") or ""),
+                    "category_l1": str(row.get("category_l1") or ""),
+                    "category_l2": str(row.get("category_l2") or ""),
+                    "category_l3": str(row.get("category_l3") or ""),
+                    "category_l4": str(row.get("category_l4") or ""),
                     "ctr_pct": float(row.get("ctr_pct") or 0.0),
                     "demand_score": float(row.get("demand_score") or 0.0),
                     "competition_component": float(row.get("competition_component") or 0.0),
@@ -631,6 +659,11 @@ class RecommendedKeywordEngine:
                     "metric_basis": row.get("metric_basis") or "mobile",
                     "monthly_search_volume": int(row.get("monthly_search_volume") or 0),
                     "product_count": int(row.get("product_count") or 0),
+                    "category_path": str(row.get("category_path") or ""),
+                    "category_l1": str(row.get("category_l1") or ""),
+                    "category_l2": str(row.get("category_l2") or ""),
+                    "category_l3": str(row.get("category_l3") or ""),
+                    "category_l4": str(row.get("category_l4") or ""),
                     "ctr_pct": float(row.get("ctr_pct") or 0.0),
                     "demand_score": float(row.get("demand_score") or 0.0),
                     "competition_component": float(row.get("competition_component") or 0.0),

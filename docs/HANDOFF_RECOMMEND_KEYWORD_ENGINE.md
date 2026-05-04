@@ -2,6 +2,8 @@
 
 다음 대화에서 이어가기 위한 요약입니다.
 
+**최근 세션(2026-05-05)**: MODE2 단일창 연속 크롤, `sql/007` 사용 기록, 대시보드 운영 문구 — 상세는 **`docs/HANDOFF_SESSION_2026-05-05.md`** 참고.
+
 ## 목표(완료 방향)
 
 - **추천 엔진**: 연관 확장 → 네이버 모바일 필터 → `keyword_score` → (옵션) 쿠팡 → `final_score = 0.5*keyword_score + 0.5*sales_power` 유지.
@@ -18,7 +20,8 @@
 | 설정 로드 | `revenue_keyword_settings.py`, `revenue_keyword_discovery.py` |
 | YAML | `config/revenue_keyword_guide.yaml`, `config/revenue_keyword_discovery.yaml` |
 | DB | `db.py` (`ensure_schema`, `insert_recommended_keywords`, `insert_recommended_keyword_candidates`, `build_recommend_engine_coupang_snapshot_payload`) |
-| SQL | `sql/003_*`, `004_*`, `005_recommended_keyword_candidates_mariadb.sql` |
+| SQL | `sql/003_*` … `007_coupang_autocollect_mode2_usage.sql` (MODE2 사용 기록) |
+| MODE2 | `coupang_mode2_session.py`, `coupang_mode2_probe_eval.js` |
 | Streamlit | `app_web.py`, `view_pages/04_revenue_keywords.py`, `web_common.py` (`get_tool` 캐시 버전 `_TOOL_RESOURCE_VERSION`) |
 | CLI | `run_recommend.py` |
 

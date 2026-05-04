@@ -11,6 +11,7 @@ from typing import Any, Dict, Generator, Iterable, List, Optional
 from urllib.parse import quote, unquote, urlparse
 
 import pymysql
+import pymysql.err
 
 
 def is_dsn_configured() -> bool:
@@ -187,6 +188,15 @@ def log_recommended_keywords_schema_status() -> None:
                 row2 = cur.fetchone()
                 if row2 and int(row2[0] or 0) > 0:
                     print("[Schema] recommended_keyword_candidates ensured", flush=True)
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM information_schema.tables
+                    WHERE table_schema = DATABASE() AND table_name = 'coupang_autocollect_mode2_usage'
+                    """
+                )
+                row3 = cur.fetchone()
+                if row3 and int(row3[0] or 0) > 0:
+                    print("[Schema] coupang_autocollect_mode2_usage ensured", flush=True)
     except Exception as e:
         print(f"[Schema] recommended_keywords check skipped: {e}", flush=True)
 
@@ -1211,7 +1221,7 @@ def insert_recommended_keywords(
     """
     추천 엔진 결과 행 삽입.
     각 row: rank_position, keyword_text, keyword(선택·없으면 keyword_text), metric_basis,
-    monthly_search_volume, product_count, ctr_pct, demand_score, competition_component,
+    monthly_search_volume, product_count, category_path/category_l1~l4, ctr_pct, demand_score, competition_component,
     ctr_component, trend_score, keyword_score, sales_power, final_score,
     intent, season_type, reason_text, extra_json(optional dict)
     """
@@ -1231,11 +1241,11 @@ def insert_recommended_keywords(
                     """
                     INSERT INTO recommended_keywords
                     (batch_token, seed_keywords_raw, rank_position, keyword_text, keyword, metric_basis,
-                     monthly_search_volume, product_count, ctr_pct,
+                     monthly_search_volume, product_count, category_path, category_l1, category_l2, category_l3, category_l4, ctr_pct,
                      demand_score, competition_component, ctr_component, trend_score,
                      keyword_score, sales_power, final_score, intent, season_type,
                      reason_text, extra_json)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         batch_token,
@@ -1246,6 +1256,11 @@ def insert_recommended_keywords(
                         str(r.get("metric_basis") or "mobile")[:16],
                         int(r.get("monthly_search_volume") or 0),
                         int(r.get("product_count") or 0),
+                        (str(r.get("category_path") or "")[:512] or None),
+                        (str(r.get("category_l1") or "")[:128] or None),
+                        (str(r.get("category_l2") or "")[:128] or None),
+                        (str(r.get("category_l3") or "")[:128] or None),
+                        (str(r.get("category_l4") or "")[:128] or None),
                         float(r.get("ctr_pct") or 0.0),
                         float(r.get("demand_score") or 0.0),
                         float(r.get("competition_component") or 0.0),
@@ -1339,10 +1354,10 @@ def insert_recommended_keyword_candidates(
                     """
                     INSERT INTO recommended_keyword_candidates
                     (batch_token, seed_keywords_raw, rank_position, keyword_text, keyword, metric_basis,
-                     monthly_search_volume, product_count, ctr_pct,
+                     monthly_search_volume, product_count, category_path, category_l1, category_l2, category_l3, category_l4, ctr_pct,
                      demand_score, competition_component, ctr_component, trend_score,
                      keyword_score, intent, season_type, reason_text, extra_json)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         batch_token,
@@ -1353,6 +1368,11 @@ def insert_recommended_keyword_candidates(
                         str(r.get("metric_basis") or "mobile")[:16],
                         int(r.get("monthly_search_volume") or 0),
                         int(r.get("product_count") or 0),
+                        (str(r.get("category_path") or "")[:512] or None),
+                        (str(r.get("category_l1") or "")[:128] or None),
+                        (str(r.get("category_l2") or "")[:128] or None),
+                        (str(r.get("category_l3") or "")[:128] or None),
+                        (str(r.get("category_l4") or "")[:128] or None),
                         float(r.get("ctr_pct") or 0.0),
                         float(r.get("demand_score") or 0.0),
                         float(r.get("competition_component") or 0.0),
@@ -1367,3 +1387,190 @@ def insert_recommended_keyword_candidates(
                 )
                 n += 1
     return n
+
+
+def query_recommended_candidate_batches(limit: int = 30) -> List[Dict[str, Any]]:
+    """최근 추천 후보 배치 목록(건수/시각)."""
+    lim = max(1, min(int(limit), 200))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT batch_token, MAX(created_at) AS max_created, COUNT(*) AS row_count
+                FROM recommended_keyword_candidates
+                GROUP BY batch_token
+                ORDER BY max_created DESC
+                LIMIT %s
+                """,
+                (lim,),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "batch_token": str(r[0] or ""),
+            "created_at": r[1],
+            "row_count": int(r[2] or 0),
+        }
+        for r in rows
+    ]
+
+
+def query_recommended_candidates_by_batch(
+    batch_token: str,
+    *,
+    category_l1: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """배치 내 후보 키워드 조회(카테고리 필터 선택)."""
+    bt = str(batch_token or "").strip()
+    if not bt:
+        return []
+    lim = max(1, min(int(limit), 2000))
+    where = ["batch_token=%s"]
+    params: List[Any] = [bt]
+    c1 = str(category_l1 or "").strip()
+    if c1:
+        where.append("category_l1=%s")
+        params.append(c1)
+    params.append(lim)
+    where_sql = " AND ".join(where)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT rank_position, keyword_text, keyword_score, category_path, category_l1, category_l2, category_l3, category_l4
+                FROM recommended_keyword_candidates
+                WHERE {where_sql}
+                ORDER BY rank_position ASC
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+            rows = cur.fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "rank_position": int(r[0] or 0),
+                "keyword_text": str(r[1] or ""),
+                "keyword_score": float(r[2] or 0.0),
+                "category_path": str(r[3] or ""),
+                "category_l1": str(r[4] or ""),
+                "category_l2": str(r[5] or ""),
+                "category_l3": str(r[6] or ""),
+                "category_l4": str(r[7] or ""),
+            }
+        )
+    return out
+
+
+def query_latest_coupang_run_meta(keyword_text: str) -> Optional[Dict[str, Any]]:
+    """키워드의 가장 최근 coupang_search_runs + 아이템 개수."""
+    kw = str(keyword_text or "").strip()[:255]
+    if not kw:
+        return None
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, source_type, collected_at
+                FROM coupang_search_runs
+                WHERE keyword_text=%s
+                ORDER BY collected_at DESC
+                LIMIT 1
+                """,
+                (kw,),
+            )
+            one = cur.fetchone()
+            if not one:
+                return None
+            rid = int(one[0])
+            cur.execute(
+                "SELECT COUNT(*) FROM coupang_search_ranked_items WHERE run_id=%s",
+                (rid,),
+            )
+            cnt = int(cur.fetchone()[0] or 0)
+    return {
+        "run_id": rid,
+        "source_type": str(one[1] or ""),
+        "collected_at": one[2],
+        "item_count": cnt,
+    }
+
+
+def query_mode2_autocollect_used_keywords(batch_token: str) -> List[str]:
+    """배치별 2번(단일창 연속) 자동 수집에 이미 사용된 키워드 목록."""
+    bt = str(batch_token or "").strip()
+    if not bt:
+        return []
+
+    def _run() -> List[str]:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT keyword_text FROM coupang_autocollect_mode2_usage
+                    WHERE batch_token=%s
+                    ORDER BY created_at ASC
+                    """,
+                    (bt,),
+                )
+                rows = cur.fetchall()
+        return [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
+
+    try:
+        return _run()
+    except pymysql.err.ProgrammingError as e:
+        # 1146 = ER_NO_SUCH_TABLE (Railway 등에 sql/007 미적용 시)
+        if e.args and int(e.args[0]) == 1146:
+            try:
+                ensure_schema()
+            except Exception:
+                pass
+            return _run()
+        raise
+
+
+def insert_mode2_autocollect_keyword_usage(
+    batch_token: str,
+    keyword_text: str,
+    *,
+    success: bool,
+    item_count: int = 0,
+    reason_short: Optional[str] = None,
+) -> None:
+    """2번 자동 수집 키워드 사용 기록(동일 batch+keyword 재선택 방지)."""
+    bt = str(batch_token or "").strip()[:64]
+    kw = str(keyword_text or "").strip()[:255]
+    if not bt or not kw:
+        return
+    rs = (str(reason_short or "").strip()[:255] or None)
+
+    def _run_ins() -> None:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO coupang_autocollect_mode2_usage
+                    (batch_token, keyword_text, success, item_count, reason_short)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                      success=VALUES(success),
+                      item_count=VALUES(item_count),
+                      reason_short=VALUES(reason_short),
+                      created_at=CURRENT_TIMESTAMP
+                    """,
+                    (bt, kw, 1 if success else 0, max(0, int(item_count)), rs),
+                )
+
+    try:
+        _run_ins()
+    except pymysql.err.ProgrammingError as e:
+        if e.args and int(e.args[0]) == 1146:
+            try:
+                ensure_schema()
+            except Exception:
+                pass
+            _run_ins()
+        else:
+            raise

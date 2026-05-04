@@ -22,6 +22,15 @@ def render_sidebar() -> bool:
             if "login_form_admin_pw" in st.session_state:
                 del st.session_state["login_form_admin_pw"]
             st.rerun()
+        with st.expander("매출 추천·쿠팡 데이터 흐름 (요약)", expanded=False):
+            st.markdown(
+                "- **4번 탭**에서 추천 엔진 실행 → 배치 `batch_token` 부여  \n"
+                "- **쿠팡 전 후보**: MariaDB `recommended_keyword_candidates` (배치·순위 `rank_position`)  \n"
+                "- **쿠팡 Top10 저장**: `coupang_search_runs` / `coupang_search_ranked_items` "
+                "(3번 탭과 동일 테이블; 1번 자동수집·엔진은 `recommend_engine`, 2번 단일창은 `recommend_engine_mode2`)  \n"
+                "- **자동 쿠팡 수집**: 4번 탭 하단 — **1번** 키워드당 창 1회 또는 **2번** 단일창 연속(실험); 2번 사용 키워드는 `coupang_autocollect_mode2_usage`  \n"
+                "- **상세·단계별 설명**: **4. 매출 키워드 추천** 탭 상단 **「현재까지 운영 방식」**"
+            )
         seeds_text = st.text_input("주제어(쉼표로 구분)", key="seed_input")
         detect_clicked = st.button("주제어 기반 카테고리 찾기", width="stretch")
         if detect_clicked:

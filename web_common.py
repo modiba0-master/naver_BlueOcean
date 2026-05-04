@@ -206,7 +206,7 @@ def format_analysis_run_history_label(row: Dict[str, Any]) -> str:
 # Streamlit은 프로세스 동안 @st.cache_resource 인스턴스를 재사용한다.
 # BlueOceanTool에 메서드/속성이 추가되면 구버전 인스턴스에는 반영되지 않으므로
 # API 표면이 바뀔 때마다 이 값을 올려 캐시를 무효화한다.
-_TOOL_RESOURCE_VERSION = 3
+_TOOL_RESOURCE_VERSION = 5
 
 
 @st.cache_resource
